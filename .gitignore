@@ -1,0 +1,23 @@
+# Arduino build output
+build/
+*.hex
+*.elf
+*.eep
+*.bin
+*.map
+.build/
+
+# Arduino IDE 2.x / CLI
+.theia/
+sketch.json
+*.tmp
+
+# Editors
+.vscode/
+.vs/
+*.code-workspace
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
