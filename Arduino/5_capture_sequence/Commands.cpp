@@ -306,9 +306,34 @@ static void printBannerPin(const __FlashStringHelper *name,
   Serial.println(line + note);
 }
 
+// Drawn column by column around a centre line, so the tube, the objective and
+// the slide stack up. Backslashes are doubled because these are C literals.
+static void printMicroscope()
+{
+  Serial.println(F("              ___"));
+  Serial.println(F("             |[_]|"));
+  Serial.println(F("             |   |"));
+  Serial.println(F("             | | |"));
+  Serial.println(F("            _|___|_"));
+  Serial.println(F("           |       |"));
+  Serial.println(F("            \\_____/"));
+  Serial.println(F("             \\___/"));
+  Serial.println(F("        _______________"));
+  Serial.println(F("       |  [=========]  |"));
+  Serial.println(F("       |_______________|"));
+  Serial.println(F("              | |"));
+  Serial.println(F("         _____|_|_____"));
+  Serial.println(F("        /             \\"));
+  Serial.println(F("       /_______________\\"));
+}
+
 void printBanner()
 {
   Serial.println(F("INFO"));
+
+  printMicroscope();
+
+  Serial.println();
 
   Serial.println(String("  ") + FLASH_STR(FIRMWARE_NAME));
 

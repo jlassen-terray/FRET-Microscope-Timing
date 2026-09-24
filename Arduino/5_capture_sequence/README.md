@@ -359,6 +359,22 @@ what is running on this board, how is it wired, and what is it set to.
 
 ```
 INFO
+              ___
+             |[_]|
+             |   |
+             | | |
+            _|___|_
+           |       |
+            \_____/
+             \___/
+        _______________
+       |  [=========]  |
+       |_______________|
+              | |
+         _____|_|_____
+        /             \
+       /_______________\
+
   FRET Capture Sequence Controller
   version 1.0.0   built Sep 23 2026 18:42:11
   Arduino Mega 2560   serial 9600 8N1
@@ -387,6 +403,12 @@ INFO END
 READY
 ```
 
+The drawing is printed *after* the `INFO` marker rather than above it, so a
+host that swallows everything between `INFO` and `INFO END` needs no special
+case for it. It costs about 440 bytes of flash and no SRAM; drop
+`printMicroscope()` from `printBanner()` in `Commands.cpp` if you want them
+back.
+
 Four things in there earn their place:
 
 - **`built`** is stamped by the compiler from `__DATE__` and `__TIME__`, so the
@@ -410,12 +432,13 @@ mid-session, and it means an unexpected `READY` still tells a host the board
 reset under it.
 
 `INFO` is rejected with `ERROR BUSY` while a sequence is running, for the same
-reason `HELP` is: at 9600 baud the block takes roughly a second to clock out,
-and `loop()` is what starts each next cycle.
+reason `HELP` is: at 9600 baud the block takes well over a second to clock out,
+and `loop()` is what starts each next cycle. The drawing is about 450 ms of
+that, and it is also 450 ms of extra delay before `READY` at boot.
 
 Identity lives in `FIRMWARE_NAME` and `FIRMWARE_VERSION` in `Config.cpp`. Both
 are `PROGMEM`, as is every fixed string in the banner, so the whole thing costs
-about 2.1 kB of flash and no meaningful SRAM. Bump `FIRMWARE_VERSION` when the
+about 2.5 kB of flash and no meaningful SRAM. Bump `FIRMWARE_VERSION` when the
 protocol changes, since that is what a host would gate its behaviour on.
 
 ### Responses
