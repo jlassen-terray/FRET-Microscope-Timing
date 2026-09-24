@@ -616,6 +616,96 @@ const String SET_CONFIRM_TIMEOUT_COMMAND = "SET CONFIRM_TIMEOUT";
 
 
 // ----------------------------------------------------------------------------
+// HELP
+//
+// Lists every command the parser accepts.
+//
+// Body lines are indented and the block is bracketed by OK HELP and
+// OK HELP END, so a host reading line by line can swallow the whole thing
+// without having to recognise each entry.
+//
+// The limits are built from the constants rather than written into the text,
+// so they cannot drift out of step with what the parser actually enforces.
+//
+// The text lives in flash via F(). It is about 700 bytes, which would be a
+// tenth of the Mega's SRAM if it sat in RAM with the String work below.
+// ----------------------------------------------------------------------------
+
+const uint8_t HELP_TEXT_COLUMN = 28;
+const uint8_t HELP_DESCRIPTION_COLUMN = 42;
+
+void padTo(String &line, uint8_t column)
+{
+  while (line.length() < column) {
+    line += ' ';
+  }
+}
+
+void printHelpLine(const __FlashStringHelper *usage,
+                   const __FlashStringHelper *text)
+{
+  String line = String("  ") + usage;
+
+  padTo(line, HELP_TEXT_COLUMN);
+
+  Serial.println(line + text);
+}
+
+void printHelpField(const __FlashStringHelper *usage,
+                    const String &limits,
+                    const __FlashStringHelper *description)
+{
+  String line = String("  ") + usage;
+
+  padTo(line, HELP_TEXT_COLUMN);
+
+  line += limits;
+
+  padTo(line, HELP_DESCRIPTION_COLUMN);
+
+  Serial.println(line + description);
+}
+
+void printHelp()
+{
+  Serial.println(F("OK HELP"));
+
+  printHelpLine(F("START"), F("run CYCLE_COUNT cycles"));
+  printHelpLine(F("ABORT | STOP"), F("stop, drop laser_enable, free shutter"));
+  printHelpLine(F("STATUS"), F("state, cycle progress, camera level"));
+  printHelpLine(F("HELP | ?"), F("this list"));
+
+  Serial.println();
+
+  printHelpField(F("SET DELAY <us>"),
+                 String(MIN_US) + "-" + MAX_US + "us",
+                 F("laser_confirm to shutter open"));
+
+  printHelpField(F("SET CAPTURE <us>"),
+                 String(MIN_US) + "-" + MAX_US + "us",
+                 F("shutter gate width"));
+
+  printHelpField(F("SET CYCLE_COUNT <n>"),
+                 String(MIN_CYCLE_COUNT) + "-" + MAX_CYCLE_COUNT,
+                 F("cycles per START"));
+
+  printHelpField(F("SET PULSE <us>"),
+                 String(MIN_PULSE_US) + "-" + MAX_PULSE_US + "us",
+                 F("laser_signal low-pulse width"));
+
+  printHelpField(F("SET CONFIRM_TIMEOUT <ms>"),
+                 String(MIN_CONFIRM_TIMEOUT_MS) + "-" + MAX_CONFIRM_TIMEOUT_MS + "ms",
+                 F("confirm wait, 0 disables"));
+
+  Serial.println();
+
+  Serial.println(F("  GET reads back any of the five settings, e.g. GET DELAY."));
+  Serial.println(F("  SET and HELP are rejected with ERROR BUSY while running."));
+
+  Serial.println(F("OK HELP END"));
+}
+
+// ----------------------------------------------------------------------------
 // HANDLE A "SET <duration>" COMMAND
 // ----------------------------------------------------------------------------
 
@@ -723,6 +813,26 @@ void processCommand(String command)
     Serial.print(" CAMERA ");
     Serial.println(
         digitalRead(CAMERA_CAPTURING_PIN) == CAMERA_ACTIVE_LEVEL ? "CAPTURING" : "IDLE");
+
+    return;
+  }
+
+  // --------------------------------------------------------------------------
+  // HELP
+  //
+  // Rejected while running for a different reason than SET is. The block is
+  // around 700 bytes, which is about 700 ms at 9600 baud once the 64 byte
+  // transmit buffer backs up, and loop() is what starts each next cycle.
+  // Blocking it for that long would stretch the gap between cycles.
+  // --------------------------------------------------------------------------
+  if (command == "HELP" || command == "?") {
+    if (isRunning()) {
+      Serial.println("ERROR BUSY");
+
+      return;
+    }
+
+    printHelp();
 
     return;
   }
