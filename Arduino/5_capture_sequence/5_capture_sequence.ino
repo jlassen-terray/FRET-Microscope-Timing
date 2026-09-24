@@ -61,22 +61,32 @@ const uint8_t LASER_SIGNAL_FIRE = LOW;
 // ----------------------------------------------------------------------------
 // LASER SIGNAL PULSE WIDTH
 //
-// Not specified, so this is a guess. Short enough to be negligible against
-// delay_us, long enough for a laser controller to latch. Adjust to taste.
+// Set with SET PULSE <us>. Short enough to be negligible against delay_us,
+// long enough for the laser controller to latch.
+//
+// The ceiling comes from delayMicroseconds(), which is only accurate up to
+// 16383 us on AVR.
 // ----------------------------------------------------------------------------
 
-const unsigned int LASER_SIGNAL_PULSE_US = 10;
+const unsigned long MIN_PULSE_US = 1;
+const unsigned long MAX_PULSE_US = 16383;
+
+unsigned long LaserSignalPulseUs = 10;
 
 
 // ----------------------------------------------------------------------------
 // LASER CONFIRM TIMEOUT
 //
-// Without this a laser that never answers leaves the sequence wedged with
-// laser_enable held high. Not in the spec; remove if the laser is trusted to
-// always respond.
+// Set with SET CONFIRM_TIMEOUT <ms>. Without it a laser that never answers
+// leaves the sequence wedged with laser_enable held high.
+//
+// 0 disables the timeout, for a laser trusted to always respond.
 // ----------------------------------------------------------------------------
 
-const unsigned long CONFIRM_TIMEOUT_MS = 1000;
+const unsigned long MIN_CONFIRM_TIMEOUT_MS = 0;
+const unsigned long MAX_CONFIRM_TIMEOUT_MS = 600000UL;
+
+unsigned long ConfirmTimeoutMs = 5000;
 
 
 // ----------------------------------------------------------------------------
@@ -85,14 +95,18 @@ const unsigned long CONFIRM_TIMEOUT_MS = 1000;
 // Timer1 is 16 bit. With a prescaler chosen automatically the reachable range
 // is wide, but resolution degrades as the prescaler grows:
 //
-//     /1     0.0625 us resolution, up to     4095 us
-//     /8     0.5    us resolution, up to    32767 us
-//     /64    4      us resolution, up to   262140 us
-//     /256   16     us resolution, up to  1048560 us
-//     /1024  64     us resolution, up to  4194240 us
+//     /1     0.0625 us resolution, up to     4096 us
+//     /8     0.5    us resolution, up to    32768 us
+//     /64    4      us resolution, up to   262144 us
+//     /256   16     us resolution, up to  1048576 us
+//     /1024  64     us resolution, up to  4194304 us
 //
 // The smallest prescaler that can represent a value is always used, so short
-// durations keep full resolution.
+// durations keep full resolution. Requests are rounded down to the resolution
+// step, and the SET/GET response echoes what was actually achieved.
+//
+// /1024 is listed for completeness but is never selected: /256 already covers
+// everything up to MAX_US.
 // ----------------------------------------------------------------------------
 
 const uint8_t TICKS_PER_US = 16;
@@ -199,6 +213,20 @@ String getCaptureResponseString()
 String getCycleCountResponseString()
 {
   return String("OK CYCLE_COUNT ") + CycleCount;
+}
+
+String getPulseResponseString()
+{
+  return String("OK PULSE ") + LaserSignalPulseUs + "us";
+}
+
+String getConfirmTimeoutResponseString()
+{
+  if (ConfirmTimeoutMs == 0) {
+    return String("OK CONFIRM_TIMEOUT 0 (disabled)");
+  }
+
+  return String("OK CONFIRM_TIMEOUT ") + ConfirmTimeoutMs + "ms";
 }
 
 
@@ -484,7 +512,7 @@ bool beginCycle()
   // laser_signal idles HIGH and dips LOW to fire.
   digitalWrite(LASER_SIGNAL_PIN, LASER_SIGNAL_FIRE);
 
-  delayMicroseconds(LASER_SIGNAL_PULSE_US);
+  delayMicroseconds((unsigned int)LaserSignalPulseUs);
 
   digitalWrite(LASER_SIGNAL_PIN, LASER_SIGNAL_IDLE);
 
@@ -580,6 +608,12 @@ const String SET_CAPTURE_COMMAND = "SET CAPTURE";
 const String GET_CYCLE_COUNT_COMMAND = "GET CYCLE_COUNT";
 const String SET_CYCLE_COUNT_COMMAND = "SET CYCLE_COUNT";
 
+const String GET_PULSE_COMMAND = "GET PULSE";
+const String SET_PULSE_COMMAND = "SET PULSE";
+
+const String GET_CONFIRM_TIMEOUT_COMMAND = "GET CONFIRM_TIMEOUT";
+const String SET_CONFIRM_TIMEOUT_COMMAND = "SET CONFIRM_TIMEOUT";
+
 
 // ----------------------------------------------------------------------------
 // HANDLE A "SET <duration>" COMMAND
@@ -609,6 +643,39 @@ void handleSetDuration(const String &argument,
   target = resolved;
 
   Serial.println(describe());
+}
+
+
+// ----------------------------------------------------------------------------
+// PARSE AND RANGE-CHECK A PLAIN SCALAR ARGUMENT
+//
+// Reports the failure itself and returns false; on success the value is in
+// out and the caller stores it wherever it belongs.
+// ----------------------------------------------------------------------------
+
+bool parseScalarArg(const String &argument,
+                    const char *label,
+                    unsigned long minValue,
+                    unsigned long maxValue,
+                    unsigned long &out)
+{
+  unsigned long value;
+
+  if (!parseUnsigned(argument, value)) {
+    Serial.println(String("ERROR ") + label + " VALUE");
+
+    return false;
+  }
+
+  if (value < minValue || value > maxValue) {
+    Serial.println(String("ERROR ") + label + " RANGE " + minValue + "-" + maxValue);
+
+    return false;
+  }
+
+  out = value;
+
+  return true;
 }
 
 
@@ -681,6 +748,18 @@ void processCommand(String command)
     return;
   }
 
+  if (command == GET_PULSE_COMMAND) {
+    Serial.println(getPulseResponseString());
+
+    return;
+  }
+
+  if (command == GET_CONFIRM_TIMEOUT_COMMAND) {
+    Serial.println(getConfirmTimeoutResponseString());
+
+    return;
+  }
+
   // --------------------------------------------------------------------------
   // SETs
   //
@@ -711,17 +790,38 @@ void processCommand(String command)
     if (command.startsWith(SET_CYCLE_COUNT_COMMAND)) {
       unsigned long value;
 
-      if (!parseUnsigned(command.substring(SET_CYCLE_COUNT_COMMAND.length()), value)) {
-        Serial.println("ERROR CYCLE_COUNT VALUE");
-
-      } else if (value < MIN_CYCLE_COUNT || value > MAX_CYCLE_COUNT) {
-        Serial.println(String("ERROR CYCLE_COUNT RANGE ") +
-                       MIN_CYCLE_COUNT + "-" + MAX_CYCLE_COUNT);
-
-      } else {
+      if (parseScalarArg(command.substring(SET_CYCLE_COUNT_COMMAND.length()),
+                         "CYCLE_COUNT", MIN_CYCLE_COUNT, MAX_CYCLE_COUNT, value)) {
         CycleCount = (uint16_t)value;
 
         Serial.println(getCycleCountResponseString());
+      }
+
+      return;
+    }
+
+    if (command.startsWith(SET_PULSE_COMMAND)) {
+      unsigned long value;
+
+      if (parseScalarArg(command.substring(SET_PULSE_COMMAND.length()),
+                         "PULSE", MIN_PULSE_US, MAX_PULSE_US, value)) {
+        LaserSignalPulseUs = value;
+
+        Serial.println(getPulseResponseString());
+      }
+
+      return;
+    }
+
+    if (command.startsWith(SET_CONFIRM_TIMEOUT_COMMAND)) {
+      unsigned long value;
+
+      if (parseScalarArg(command.substring(SET_CONFIRM_TIMEOUT_COMMAND.length()),
+                         "CONFIRM_TIMEOUT",
+                         MIN_CONFIRM_TIMEOUT_MS, MAX_CONFIRM_TIMEOUT_MS, value)) {
+        ConfirmTimeoutMs = value;
+
+        Serial.println(getConfirmTimeoutResponseString());
       }
 
       return;
@@ -762,9 +862,10 @@ void servicePending()
     Serial.println("DONE");
   }
 
-  // Laser never answered.
-  if (State == WAITING_FOR_LASER_CONFIRM &&
-      millis() - ConfirmWaitStartedMs > CONFIRM_TIMEOUT_MS) {
+  // Laser never answered. A timeout of 0 means the check is disabled.
+  if (ConfirmTimeoutMs > 0 &&
+      State == WAITING_FOR_LASER_CONFIRM &&
+      millis() - ConfirmWaitStartedMs > ConfirmTimeoutMs) {
     abortSequence();
 
     Serial.println("ERROR LASER CONFIRM TIMEOUT");

@@ -11,8 +11,9 @@ Builds on [sketch 2](../2_pure_hardware_trigger) for the hardware-toggle
 technique and [sketch 3](../3_serial_config) for the serial command interface.
 
 > **Status:** compiles clean, **not yet hardware tested**. The `laser_signal`
-> pulse width (10 µs) and the `laser_confirm` timeout (1 s) were unspecified
-> and are placeholders — both are named constants at the top of the sketch.
+> pulse width and the `laser_confirm` timeout were unspecified; both default to
+> a guess (10 µs and 5000 ms) and are adjustable at runtime with `SET PULSE`
+> and `SET CONFIRM_TIMEOUT`.
 
 ## Signals
 
@@ -125,13 +126,13 @@ sequenceDiagram
     loop cycle_count times
         M->>C: read camera_capturing
         C-->>M: HIGH (abort if LOW)
-        M->>L: laser_signal LOW 10us then HIGH
+        M->>L: laser_signal LOW for pulse_us then HIGH
+        M-->>PC: CYCLE n
         L-->>M: laser_confirm (rising edge)
         Note over M: Timer1 waits delay_us
         M-->>S: shutter_enable HIGH (Timer1 hardware)
         Note over M: Timer1 waits capture_us
         M-->>S: shutter_enable LOW (Timer1 hardware)
-        M-->>PC: CYCLE n
     end
 
     M->>L: laser_enable LOW
@@ -144,68 +145,156 @@ sequenceDiagram
 stateDiagram-v2
     [*] --> IDLE
 
-    IDLE --> WAIT_CONFIRM: START, camera HIGH<br/>pulse laser_signal
+    IDLE --> WAIT_CONFIRM: START, camera HIGH<br/>laser_enable HIGH, pulse laser_signal
     IDLE --> IDLE: START, camera LOW<br/>ERROR CAMERA NOT CAPTURING
 
     WAIT_CONFIRM --> WAIT_DELAY: laser_confirm<br/>arm Timer1 delay_us
-    WAIT_CONFIRM --> IDLE: 1s elapsed<br/>ERROR LASER CONFIRM TIMEOUT
+    WAIT_CONFIRM --> IDLE: confirm_timeout elapsed<br/>ERROR LASER CONFIRM TIMEOUT
 
     WAIT_DELAY --> CAPTURING: compare match<br/>shutter opens in hardware<br/>arm Timer1 capture_us
 
-    CAPTURING --> WAIT_CONFIRM: compare match, cycles remain<br/>shutter closes in hardware<br/>re-check camera, pulse again
+    CAPTURING --> WAIT_CONFIRM: compare match, cycles remain<br/>shutter closes in hardware<br/>camera still HIGH, pulse again
+    CAPTURING --> IDLE: compare match, cycles remain<br/>camera went LOW<br/>ERROR CAMERA NOT CAPTURING
     CAPTURING --> COMPLETE: compare match, last cycle<br/>shutter closes, laser_enable LOW
 
     COMPLETE --> WAIT_CONFIRM: START
-    CAPTURING --> IDLE: ABORT
-    WAIT_DELAY --> IDLE: ABORT
     WAIT_CONFIRM --> IDLE: ABORT
+    WAIT_DELAY --> IDLE: ABORT
+    CAPTURING --> IDLE: ABORT
 ```
 
 The shutter transitions are marked *in hardware* because Timer1 drives OC1A
 directly — the ISR runs after the edge has already happened and only decides
 what comes next.
 
+Two implementation details the diagram smooths over. The camera re-check and
+the next `laser_signal` pulse happen in `loop()`, not in the ISR — the ISR sets
+a flag, so the state stays `CAPTURING` for the moment between the shutter
+closing and the next cycle arming. And a `confirm_timeout` of `0` removes the
+`WAIT_CONFIRM --> IDLE` timeout edge entirely.
+
 ## Commands
 
-9600 baud, newline-terminated, case-insensitive.
+9600 baud, newline-terminated, case-insensitive. The sketch prints `READY`
+once on boot.
 
-| Command | Notes |
-|---------|-------|
-| `SET DELAY <us>` / `GET DELAY` | 1–1000000 µs |
-| `SET CAPTURE <us>` / `GET CAPTURE` | 1–1000000 µs |
-| `SET CYCLE_COUNT <n>` / `GET CYCLE_COUNT` | 1–65535 |
-| `START` | Emits `STARTED`, `CYCLE <n>` per cycle, then `DONE` |
-| `ABORT` (or `STOP`) | Drops laser_enable, releases the shutter |
-| `STATUS` | State, cycle progress, live camera level |
+| Command | Range | Default | Meaning |
+|---------|-------|---------|---------|
+| `SET DELAY <us>` / `GET DELAY` | 1–1000000 µs | 1 | laser_confirm to shutter open |
+| `SET CAPTURE <us>` / `GET CAPTURE` | 1–1000000 µs | 50 | shutter gate width |
+| `SET CYCLE_COUNT <n>` / `GET CYCLE_COUNT` | 1–65535 | 1 | iterations per `START` |
+| `SET PULSE <us>` / `GET PULSE` | 1–16383 µs | 10 | laser_signal low-pulse width |
+| `SET CONFIRM_TIMEOUT <ms>` / `GET CONFIRM_TIMEOUT` | 0–600000 ms | 5000 | **0 disables** |
+| `START` | — | — | Runs the sequence |
+| `ABORT` (or `STOP`) | — | — | Drops laser_enable, releases the shutter |
+| `STATUS` | — | — | State, cycle progress, live camera level |
 
-`SET` is rejected with `ERROR BUSY` while a sequence is running. That
-restriction is what makes it safe for the Timer1 ISR to read the configuration
-without volatile qualifiers or interrupt guards.
+`SET PULSE` is the runtime control for `LaserSignalPulseUs`;
+`SET CONFIRM_TIMEOUT` for `ConfirmTimeoutMs`.
 
-Errors: `ERROR BUSY`, `ERROR CAMERA NOT CAPTURING`,
-`ERROR LASER CONFIRM TIMEOUT`, `ERROR UNKNOWN COMMAND`,
-`ERROR <FIELD> VALUE`, `ERROR <FIELD> RANGE <lo>-<hi>`.
+### Responses
 
-`ABORT`/`STOP`, the confirm timeout, and `STATUS` were not in the original
-spec. They were added because a laser controller needs a stop, a silent laser
-should not be able to wedge the sequence with `laser_enable` held high, and
-bring-up is easier with a status read. All three are easy to strip.
+```
+READY
+OK DELAY 5000us -> 5000us (10000 ticks @ /8)
+OK CAPTURE 50us -> 50us (800 ticks @ /1)
+OK CYCLE_COUNT 2
+OK PULSE 25us
+OK CONFIRM_TIMEOUT 5000ms
+OK CONFIRM_TIMEOUT 0 (disabled)
+OK ABORTED
+OK STATUS IDLE CYCLE 0/2 CAMERA IDLE
+```
+
+`STATUS` is `OK STATUS <IDLE|RUNNING|COMPLETE> CYCLE <done>/<total> CAMERA
+<IDLE|CAPTURING>`.
+
+A full run emits, in order:
+
+```
+> START
+STARTED
+CYCLE 1
+CYCLE 2
+DONE
+```
+
+`CYCLE <n>` is printed when cycle *n* begins — just after its `laser_signal`
+pulse — not when it finishes.
+
+`PULSE` is capped at 16383 µs because that is the largest value
+`delayMicroseconds()` handles accurately on AVR.
+
+`CONFIRM_TIMEOUT 0` disables the timeout entirely, for a laser trusted to
+always respond. Be aware that a silent laser will then wedge the sequence with
+`laser_enable` held high until you send `ABORT`.
+
+`SET` is rejected with `ERROR BUSY` while a sequence is running. For `DELAY`
+and `CAPTURE` that restriction is load-bearing — it is what makes it safe for
+the Timer1 ISR to read them without volatile qualifiers or interrupt guards.
+`PULSE` and `CONFIRM_TIMEOUT` are only read from `loop()` and could safely
+change mid-run, but are held to the same rule so the protocol has one
+consistent behaviour.
+
+### Errors
+
+| Error | Cause |
+|-------|-------|
+| `ERROR UNKNOWN COMMAND` | Unrecognised input |
+| `ERROR BUSY` | `START` or any `SET` while a sequence is running |
+| `ERROR CAMERA NOT CAPTURING` | `camera_capturing` low at the start of any cycle; sequence aborts |
+| `ERROR LASER CONFIRM TIMEOUT` | No `laser_confirm` within `confirm_timeout`; sequence aborts |
+| `ERROR <FIELD> VALUE` | Argument is not a plain non-negative integer |
+| `ERROR <FIELD> RANGE <lo>-<hi>` | Argument parsed but out of range |
+
+`<FIELD>` is `DELAY`, `CAPTURE`, `CYCLE_COUNT`, `PULSE`, or `CONFIRM_TIMEOUT`.
+The `RANGE` message appends `us` for `DELAY` and `CAPTURE`
+(`ERROR DELAY RANGE 1-1000000us`) and is unitless for the rest
+(`ERROR PULSE RANGE 1-16383`).
+
+### Beyond the original spec
+
+The spec called for `delay_us`, `capture_us`, `cycle_count`, and `START`.
+These were added and are all easy to strip:
+
+- `ABORT`/`STOP` — a laser controller needs a stop.
+- `CONFIRM_TIMEOUT` — a silent laser should not be able to wedge the sequence
+  with `laser_enable` held high.
+- `PULSE` — the spec said `laser_signal` toggles low then high but not for how
+  long, so the width is a guess made adjustable rather than a buried constant.
+- `STATUS` — bring-up is easier with a state read.
+- The prescaler selection, which extends `delay_us` and `capture_us` past the
+  4096 µs a fixed unprescaled Timer1 would cap them at.
 
 ## Timing resolution
 
-Timer1 auto-selects the smallest prescaler that can represent each duration, so
-short windows keep full resolution and long ones are still reachable:
+`DELAY` and `CAPTURE` are driven by Timer1, which is 16 bit and counts at
+16 MHz. A single prescaler setting therefore cannot cover both a 1 µs delay and
+a 1 s one. The sketch resolves each duration independently, picking the
+**smallest prescaler that can represent it** — so short windows keep full
+resolution and long ones stay reachable:
 
-| Prescaler | Resolution | Max |
-|-----------|-----------|-----|
-| /1 | 0.0625 µs | 4095 µs |
-| /8 | 0.5 µs | 32767 µs |
-| /64 | 4 µs | 262140 µs |
-| /256 | 16 µs | 1048560 µs |
+| Prescaler | Resolution | Used for | Max ticks |
+|-----------|------------|----------|-----------|
+| /1 | 0.0625 µs | 1 – 4096 µs | 65536 |
+| /8 | 0.5 µs | 4097 – 32768 µs | 65536 |
+| /64 | 4 µs | 32769 – 262144 µs | 65536 |
+| /256 | 16 µs | 262145 – 1000000 µs | 62500 |
 
-`GET`/`SET` echo both the requested and the achieved value, e.g.
-`OK DELAY 5000us -> 5000us (1250 ticks @ /64)`, so truncation is always visible
-rather than silent.
+A request is rounded **down** to the resolution step of whichever prescaler is
+chosen. `GET`/`SET` echo the requested value, the achieved value, the tick
+count, and the prescaler, so any rounding is visible rather than silent:
+
+```
+SET DELAY 5000       ->  OK DELAY 5000us -> 5000us (10000 ticks @ /8)
+SET CAPTURE 300001   ->  OK CAPTURE 300001us -> 300000us (18750 ticks @ /256)
+```
+
+`MIN_US` is 1 and `MAX_US` is 1000000. The code also contains a /1024 entry,
+but it is unreachable: /256 already covers the full range up to `MAX_US`.
+
+Timer1's CTC mode counts `0..OCR1A` inclusive, so the register is loaded with
+one less than the tick count shown above.
 
 ## Build
 
