@@ -17,6 +17,7 @@ utilities.
 | 3 | `3_serial_config` | Serial command interface for delay / exposure / cycle count, plus the capture-sequence state machine. |
 | 4 | `4_shift_register_dis` | 4-digit 7-segment display driven over hardware SPI, multiplexed from a Timer2 ISR. |
 | 5 | `5_capture_sequence` | The real controller: camera gate check, laser handshake, hardware-timed delay and capture window, repeated for a configured cycle count. **[Full docs →](Arduino/5_capture_sequence/README.md)** |
+| 6 | `6_precise_capture` | Sketch 5 cut down to timing: interrupts off for the run, every edge hardware-placed or polled, all intervals within 1 µs. **[Full docs →](Arduino/6_precise_capture/README.md)** |
 
 ## Wiring
 
@@ -93,6 +94,9 @@ disconnects the compare output to force a known-closed state at the start of a
 sequence and on abort.
 
 ## Status
+
+Sketch 6 is the precision variant of sketch 5; see [its README](Arduino/6_precise_capture/README.md)
+for the timing budget. Neither has been run against hardware yet.
 
 Sketch 5 is the current target and compiles clean, but has not been run
 against hardware. Signals, wiring diagrams, serial protocol, and timing
