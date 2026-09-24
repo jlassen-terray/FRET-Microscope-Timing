@@ -65,6 +65,31 @@ static volatile uint8_t LogTail = 0;
 static volatile uint8_t LogDropped = 0;
 
 
+// Called with interrupts off.
+static void pushEntry(uint8_t event, uint16_t cycle, unsigned long now,
+                      uint16_t fine)
+{
+  uint8_t next = LogHead + 1;
+
+  if (next >= LOG_CAPACITY) {
+    next = 0;
+  }
+
+  if (next == LogTail) {
+    if (LogDropped < 255) {
+      LogDropped++;
+    }
+
+  } else {
+    LogRing[LogHead].timestampUs = now;
+    LogRing[LogHead].fineTicks = fine;
+    LogRing[LogHead].cycle = cycle;
+    LogRing[LogHead].event = event;
+
+    LogHead = next;
+  }
+}
+
 void logEventForCycle(uint8_t event, uint16_t cycle)
 {
   if (!VerboseEnabled) {
@@ -86,25 +111,24 @@ void logEventForCycle(uint8_t event, uint16_t cycle)
   // half a Timer5 wrap -- 2048 us -- to unwrap correctly.
   uint16_t fine = TCNT5;
 
-  uint8_t next = LogHead + 1;
+  pushEntry(event, cycle, now, fine);
 
-  if (next >= LOG_CAPACITY) {
-    next = 0;
+  SREG = sreg;
+}
+
+void logEventAt(uint8_t event, uint16_t cycle, uint16_t fineTicks,
+                unsigned long ageUs)
+{
+  if (!VerboseEnabled) {
+    return;
   }
 
-  if (next == LogTail) {
-    if (LogDropped < 255) {
-      LogDropped++;
-    }
+  unsigned long now = micros() - ageUs;
 
-  } else {
-    LogRing[LogHead].timestampUs = now;
-    LogRing[LogHead].fineTicks = fine;
-    LogRing[LogHead].cycle = cycle;
-    LogRing[LogHead].event = event;
+  uint8_t sreg = SREG;
+  cli();
 
-    LogHead = next;
-  }
+  pushEntry(event, cycle, now, fineTicks);
 
   SREG = sreg;
 }
@@ -218,6 +242,8 @@ void drainLog()
       case LOG_CYCLE_BEGIN:   Serial.print(F("CYCLE_BEGIN"));   break;
       case LOG_PULSE:         Serial.print(F("PULSE"));         break;
       case LOG_CONFIRM:       Serial.print(F("CONFIRM"));       break;
+      case LOG_CONFIRM_BOUNCE:
+                              Serial.print(F("CONFIRM_BOUNCE")); break;
       case LOG_SHUTTER_OPEN:  Serial.print(F("SHUTTER_OPEN"));  break;
       case LOG_SHUTTER_CLOSE: Serial.print(F("SHUTTER_CLOSE")); break;
       case LOG_DONE:          Serial.print(F("DONE"));          break;

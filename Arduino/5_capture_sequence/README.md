@@ -7,13 +7,17 @@ laser, wait a configured delay, then open a capture gate for a configured
 window. The delay and capture edges are produced by the Timer1 compare output
 rather than by software, so interrupt latency stays out of the timing path.
 
-Builds on [sketch 2](../2_pure_hardware_trigger) for the hardware-toggle
-technique and [sketch 3](../3_serial_config) for the serial command interface.
+Builds on [sketch 2](../2_pure_hardware_trigger) for the hardware
+compare-output technique and [sketch 3](../3_serial_config) for the serial command interface.
 
-> **Status:** compiles clean, **not yet hardware tested**. The `laser_signal`
+> **Status:** compiles clean, **bench testing in progress**. The `laser_signal`
 > pulse width and the `laser_confirm` timeout were unspecified; both default to
 > a guess (10 µs and 5000 ms) and are adjustable at runtime with `SET PULSE`
 > and `SET CONFIRM_TIMEOUT`.
+>
+> `CONFIRM_DEBOUNCE` defaults to 20 ms because bench testing drives
+> `laser_confirm` from a button. **Zero it on rig install** — see
+> [On rig install](#on-rig-install).
 
 ## Signals
 
@@ -34,9 +38,14 @@ that is what produces the gate edges in hardware.
 are INT0=21, INT1=20, INT2=19, INT3=18, INT4=2, INT5=3.
 
 Inputs are treated as **active-high and push-pull**. If a source is
-open-collector, switch it to `INPUT_PULLUP`, flip `CAMERA_ACTIVE_LEVEL`, and
-set `LASER_CONFIRM_EDGE` to `FALLING` — the latter two are in `Config.h`, the
-`pinMode` call is in `setup()`.
+open-collector, set `LASER_CONFIRM_INPUT_MODE` to `INPUT_PULLUP`,
+`LASER_CONFIRM_EDGE` to `FALLING`, and flip `CAMERA_ACTIVE_LEVEL` — all three
+are in `Config.h`.
+
+If `laser_confirm` is a **button** rather than a laser, see
+[Driving `laser_confirm` from a button](#driving-laser_confirm-from-a-button).
+Both the bias and the debounce need changing, and the symptom when they are
+not is a shutter that looks stuck open.
 
 ## Wiring
 
@@ -111,6 +120,85 @@ flowchart LR
 Note the optoisolated form inverts the signal and needs a pull-up, so it is the
 `INPUT_PULLUP` / `FALLING` configuration described under Signals.
 
+## Driving `laser_confirm` from a button
+
+A push-button on pin 2 is the obvious way to stand in for the laser during
+bring-up, and it needs two changes. Without them the shutter appears to stick
+open, which is worth explaining because the symptom does not resemble the
+cause.
+
+**Bias the pin.** `LASER_CONFIRM_INPUT_MODE` defaults to `INPUT`, which assumes
+something drives the pin at all times. A button does not: while it is open the
+pin is floating, and a floating high-impedance input picks up enough coupled
+noise to cross the logic threshold on its own — over and over, at whatever rate
+the noise wanders. Every one of those crossings is a confirm. Set
+`LASER_CONFIRM_INPUT_MODE` to `INPUT_PULLUP` and `LASER_CONFIRM_EDGE` to
+`FALLING` in `Config.h`, and wire the button between pin 2 and GND:
+
+```mermaid
+flowchart LR
+    P2["Pin 2 / INT4<br/>laser_confirm<br/>INPUT_PULLUP, FALLING"] --- BTN["button"] --- GND["GND"]
+```
+
+**Debounce it.** `CONFIRM_DEBOUNCE` defaults to 20000 µs, which covers this —
+but understand what it is for, because it is the setting to zero on rig
+install. One press of a mechanical contact delivers a train of edges over
+several milliseconds. The first is taken as the confirm; the rest land
+mid-cycle, where the state machine rejects them — until the cycle *ends*. With
+the default 1 µs delay and 50 µs gate a cycle is over in under 100 µs, so the
+next one is already armed and waiting, and the next bounce edge is accepted as
+its confirm. One press walks the sequence through as many cycles as the contact
+had bounces.
+
+The gate is not actually stuck. Each cycle still closes, and a scope on pin 11
+shows it. But the gate is
+reopening every millisecond or so for the length of the bounce train, and no
+mechanical shutter can follow that — it just stays open until the train ends.
+A floating pin produces the same thing and never stops, since the noise never
+settles.
+
+With `VERBOSE 1` on, the rejected edges are logged as `CONFIRM_BOUNCE`, so the
+diagnosis is directly visible:
+
+```
+V 1 CYCLE_BEGIN t=4011520
+V 1 PULSE t=4011532 +12
+V 1 CONFIRM t=4013264 +1732
+V 1 SHUTTER_OPEN t=4013272 +8
+V 1 SHUTTER_CLOSE t=4013324 +52
+V 2 CONFIRM_BOUNCE t=4014108 +784
+V 2 CONFIRM_BOUNCE t=4015820 +1712
+V 2 CYCLE_BEGIN t=4016060 +240
+```
+
+**The delay starts on the falling edge.** A contact bounces on release too,
+and both trains hold both edge directions, so a lockout timed from the press
+still lets the release through as a second confirm. While `CONFIRM_DEBOUNCE`
+is non-zero the interrupt is therefore `CHANGE`: every edge restarts the
+quiet window, and a train only starts the delay if its first edge leaves the
+level the line had settled at, `DEBOUNCED_IDLE_LEVEL` (`HIGH`). One press is
+one cycle. `LASER_CONFIRM_EDGE` is not used in this mode.
+
+| Wiring | Delay starts on |
+|--------|-----------------|
+| Button to GND, `INPUT_PULLUP` | the press |
+| Button to 5V, external pull-down | the release |
+
+### On rig install
+
+**`SET CONFIRM_DEBOUNCE 0`.** Not optional: while it is non-zero a laser
+*cannot* confirm. Both edges of its pulse land inside one lockout, so the
+falling edge is rejected as bounce, and every cycle ends in
+`ERROR LASER CONFIRM TIMEOUT`. The default is set for the bench, not the rig
+— it is
+`ConfirmDebounceUs` in `Settings.cpp` if you want the board to boot that way.
+
+At `0` the debounce is out of the timing path entirely: the interrupt goes
+back to `LASER_CONFIRM_EDGE`, and the `micros()` read and the comparison are
+gated on the value being non-zero. That gating is
+deliberate — everything ahead of `armTimer1()` in that ISR is latency on the
+front of `delay_us`.
+
 ## Signal map
 
 A cycle is a closed loop that leaves the board on `laser_signal`, comes back
@@ -140,9 +228,9 @@ flowchart TB
         GATE{"camera_capturing<br/>HIGH?"}
         PULSE["laser_signal HIGH → LOW → HIGH<br/>pin 9, loop() blocks pulse_us"]
         ARM["arm Timer1 with delay_us<br/>laserConfirmISR()"]
-        OPEN["OC1A toggles HIGH<br/>shutter_enable opens"]
+        OPEN["OC1A sets HIGH<br/>shutter_enable opens"]
         REARM["arm Timer1 with capture_us<br/>TIMER1_COMPA ISR"]
-        CLOSE["OC1A toggles LOW<br/>shutter_enable closes"]
+        CLOSE["OC1A clears LOW<br/>shutter_enable closes"]
         MORE{"cycles<br/>remain?"}
         OFF["laser_enable LOW<br/>pin 8"]
         ERRC["ERROR CAMERA<br/>NOT CAPTURING"]
@@ -193,6 +281,15 @@ interval therefore runs about one interrupt entry longer than its configured
 value — a few microseconds at 16 MHz. Small and near-constant, but not zero;
 if the gate width has to be exact, measure it and trim `CAPTURE` to suit.
 
+The capture re-arm is later than that when `delay_us` is short. The compare
+ISR cannot run until `laserConfirmISR()` has returned, so a 1 µs delay's gate
+stays open by the rest of that ISR plus the compare ISR's entry. That is why
+`laserConfirmISR()` does nothing after arming but one Timer5 read, logs
+nothing itself, and runs the same with `VERBOSE` on or off. It is also why the
+edges are *set* and *clear* rather than toggle: CTC keeps matching every `delay_us` until the re-arm, and in
+toggle mode each of those extra matches flipped the gate. An odd number left
+it inverted — shut during the capture, open between cycles.
+
 ### One cycle in time
 
 Not to scale: `delay_us` and `capture_us` are configurable up to a second each,
@@ -210,9 +307,11 @@ while `pulse_us` defaults to 10 µs.
 ```
 
 `camera_capturing` is drawn flat because a cycle cannot start without it, but
-it is only *read* once per cycle, just before the `laser_signal` pulse — a
-camera that drops out mid-gate is not noticed until the next cycle begins. Only the rising edge of
-`laser_confirm` matters; how long the laser holds it is ignored. And the gap
+it is only *read* once per cycle, before that cycle's serial output and
+`laser_signal` pulse — a camera that drops out mid-gate, or while the
+`CYCLE` line is flushing, is not noticed until the next cycle begins. Only
+the rising edge of `laser_confirm` matters; how long the laser holds it is
+ignored. And the gap
 between `laser_signal` rising and `laser_confirm` arriving belongs to the
 laser controller, not to this sketch — it is unbounded except by
 `confirm_timeout`.
@@ -238,8 +337,8 @@ sequenceDiagram
     loop cycle_count times
         M->>C: read camera_capturing
         C-->>M: HIGH (abort if LOW)
+        M-->>PC: CYCLE n (flushed)
         M->>L: laser_signal LOW for pulse_us then HIGH
-        M-->>PC: CYCLE n
         L-->>M: laser_confirm (rising edge)
         Note over M: Timer1 waits delay_us
         M-->>S: shutter_enable HIGH (Timer1 hardware)
@@ -261,6 +360,7 @@ stateDiagram-v2
     IDLE --> IDLE: START, camera LOW<br/>ERROR CAMERA NOT CAPTURING
 
     WAIT_CONFIRM --> WAIT_DELAY: laser_confirm<br/>arm Timer1 delay_us
+    WAIT_CONFIRM --> WAIT_CONFIRM: laser_confirm within<br/>confirm_debounce of the<br/>last edge — ignored
     WAIT_CONFIRM --> IDLE: confirm_timeout elapsed<br/>ERROR LASER CONFIRM TIMEOUT
 
     WAIT_DELAY --> CAPTURING: compare match<br/>shutter opens in hardware<br/>arm Timer1 capture_us
@@ -283,7 +383,13 @@ Two implementation details the diagram smooths over. The camera re-check and
 the next `laser_signal` pulse happen in `loop()`, not in the ISR — the ISR sets
 a flag, so the state stays `CAPTURING` for the moment between the shutter
 closing and the next cycle arming. And a `confirm_timeout` of `0` removes the
-`WAIT_CONFIRM --> IDLE` timeout edge entirely.
+`WAIT_CONFIRM --> IDLE` timeout edge entirely, as a `confirm_debounce` of `0`
+— the rig setting — removes the self-loop.
+
+The self-loop is the only place `laser_confirm` is *deliberately* discarded.
+Edges arriving in `WAIT_DELAY` or `CAPTURING` are dropped too, but that falls
+out of there being no transition for them; the debounce lockout is the case
+where the sequence is waiting for exactly this edge and refuses it anyway.
 
 ## Commands
 
@@ -302,6 +408,7 @@ verbose logging.
 | `SET CYCLE_COUNT <n>` / `GET CYCLE_COUNT` | 1–65535 | 1 | iterations per `START` |
 | `SET PULSE <us>` / `GET PULSE` | 1–16383 µs | 10 | laser_signal low-pulse width |
 | `SET CONFIRM_TIMEOUT <ms>` / `GET CONFIRM_TIMEOUT` | 0–600000 ms | 5000 | **0 disables** |
+| `SET CONFIRM_DEBOUNCE <us>` / `GET CONFIRM_DEBOUNCE` | 0–1000000 µs | 20000 | Contact lockout, **0 disables** — [set to 0 on rig install](#driving-laser_confirm-from-a-button) |
 | `SET VERBOSE <0\|1>` / `GET VERBOSE` | 0–1 | 0 | Event logging, see below |
 | `START` | — | — | Runs the sequence |
 | `ABORT` (or `STOP`) | — | — | Drops laser_enable, releases the shutter |
@@ -309,8 +416,9 @@ verbose logging.
 | `INFO` | — | — | Reprints the boot banner |
 | `HELP` (or `?`) | — | — | Lists every command |
 
-`SET PULSE` is the runtime control for `LaserSignalPulseUs`;
-`SET CONFIRM_TIMEOUT` for `ConfirmTimeoutMs`.
+`SET PULSE` is the runtime control for `LaserSignalPulseUs`,
+`SET CONFIRM_TIMEOUT` for `ConfirmTimeoutMs`, and `SET CONFIRM_DEBOUNCE` for
+`ConfirmDebounceUs`.
 
 ### HELP
 
@@ -332,9 +440,10 @@ OK HELP
   SET CYCLE_COUNT <n>       1-65535       cycles per START
   SET PULSE <us>            1-16383us     laser_signal low-pulse width
   SET CONFIRM_TIMEOUT <ms>  0-600000ms    confirm wait, 0 disables
+  SET CONFIRM_DEBOUNCE <us> 0-1000000us   contact lockout, 0 disables
   SET VERBOSE <0|1>         0-1           measured event log
 
-  GET reads back any of the six settings, e.g. GET DELAY.
+  GET reads back any of the seven settings, e.g. GET DELAY.
   SET, HELP and INFO are rejected with ERROR BUSY while running.
 OK HELP END
 ```
@@ -392,6 +501,7 @@ INFO
     CYCLE_COUNT       1
     PULSE             10us
     CONFIRM_TIMEOUT   5000ms
+    CONFIRM_DEBOUNCE  20000us
     VERBOSE           0
 
   Inputs now
@@ -451,6 +561,8 @@ OK CYCLE_COUNT 2
 OK PULSE 25us
 OK CONFIRM_TIMEOUT 5000ms
 OK CONFIRM_TIMEOUT 0 (disabled)
+OK CONFIRM_DEBOUNCE 20000us
+OK CONFIRM_DEBOUNCE 0 (disabled)
 OK VERBOSE 1
 OK ABORTED
 OK STATUS IDLE CYCLE 0/2 CAMERA IDLE
@@ -469,8 +581,12 @@ CYCLE 2
 DONE
 ```
 
-`CYCLE <n>` is printed when cycle *n* begins — just after its `laser_signal`
-pulse — not when it finishes.
+`CYCLE <n>` is printed when cycle *n* begins — just before its `laser_signal`
+pulse, and fully flushed before it — not when it finishes. Nothing is written
+between the pulse and the gate closing, because a byte still transmitting
+when the confirm arrives delays `laserConfirmISR()` by the USART interrupt.
+Host traffic is the exception the firmware cannot hold back: a command sent
+mid-run, and its reply, cost the same. Send nothing but `ABORT` during a run.
 
 `PULSE` is capped at 16383 µs because that is the largest value
 `delayMicroseconds()` handles accurately on AVR.
@@ -479,12 +595,12 @@ pulse — not when it finishes.
 always respond. Be aware that a silent laser will then wedge the sequence with
 `laser_enable` held high until you send `ABORT`.
 
-`SET` is rejected with `ERROR BUSY` while a sequence is running. For `DELAY`
-and `CAPTURE` that restriction is load-bearing — it is what makes it safe for
-the Timer1 ISR to read them without volatile qualifiers or interrupt guards.
-`PULSE` and `CONFIRM_TIMEOUT` are only read from `loop()` and could safely
-change mid-run, but are held to the same rule so the protocol has one
-consistent behaviour.
+`SET` is rejected with `ERROR BUSY` while a sequence is running. For `DELAY`,
+`CAPTURE` and `CONFIRM_DEBOUNCE` that restriction is load-bearing — it is what
+makes it safe for the two ISRs to read them without volatile qualifiers or
+interrupt guards. `PULSE` and `CONFIRM_TIMEOUT` are only read from `loop()` and
+could safely change mid-run, but are held to the same rule so the protocol has
+one consistent behaviour.
 
 ### Errors
 
@@ -497,8 +613,8 @@ consistent behaviour.
 | `ERROR <FIELD> VALUE` | Argument is not a plain non-negative integer |
 | `ERROR <FIELD> RANGE <lo>-<hi>` | Argument parsed but out of range |
 
-`<FIELD>` is `DELAY`, `CAPTURE`, `CYCLE_COUNT`, `PULSE`, `CONFIRM_TIMEOUT`, or
-`VERBOSE`.
+`<FIELD>` is `DELAY`, `CAPTURE`, `CYCLE_COUNT`, `PULSE`, `CONFIRM_TIMEOUT`,
+`CONFIRM_DEBOUNCE`, or `VERBOSE`.
 The `RANGE` message appends `us` for `DELAY` and `CAPTURE`
 (`ERROR DELAY RANGE 1-1000000us`) and is unitless for the rest
 (`ERROR PULSE RANGE 1-16383`).
@@ -536,6 +652,12 @@ event — is the useful one:
 | `CONFIRM` → `SHUTTER_OPEN` | `delay_us` as actually produced |
 | `SHUTTER_OPEN` → `SHUTTER_CLOSE` | `capture_us` as actually produced |
 | `SHUTTER_CLOSE` → next `CYCLE_BEGIN` | inter-cycle turnaround |
+
+`CONFIRM_BOUNCE` is the one event that is not a step in the cycle: it marks a
+`laser_confirm` edge rejected by `CONFIRM_DEBOUNCE`. It only ever appears when
+that lockout is non-zero, and it is how you tell contact bounce from a laser
+answering twice — see [Driving `laser_confirm` from a
+button](#driving-laser_confirm-from-a-button).
 
 ### Where the decimals come from
 
@@ -581,7 +703,11 @@ in a 4 µs step.
 Timer1 compare output. Events are captured into a 32-entry ring buffer —
 a `micros()` read, a `TCNT5` read, and a few stores — and every `logEvent()`
 call is placed *after* the timer registers have been written, so no edge ever
-waits on it. Formatting and the serial write happen later, in `loop()`. The
+waits on it. `CONFIRM` goes further: it is not logged from `laserConfirmISR()`
+at all, since work there delays the capture re-arm and widens the gate. The
+ISR keeps a Timer5 stamp and the compare ISR pushes the entry once both
+windows are in hardware, so `VERBOSE` adds nothing between confirm and
+close. Formatting and the serial write happen later, in `loop()`. The
 pulse itself is bracketed so no log call can land between its two edges and
 widen it.
 
@@ -590,8 +716,9 @@ only ever read. An overflow interrupt at 62.5 ns resolution would fire every
 4 ms and put latency jitter back into `laserConfirmISR`, which is the one
 thing the hardware-edge design exists to keep out.
 
-**Yes, the inter-cycle gap.** Draining the log is a blocking serial write, and
-the next cycle is armed from `loop()`. A verbose cycle is roughly 240
+**Yes, the inter-cycle gap.** The log is drained, and flushed, at the start of
+the next cycle, before its pulse — so none of it is on the wire while the
+laser can answer. The next cycle waits for it. A verbose cycle is roughly 240
 characters:
 
 | Baud | Per cycle |
@@ -601,9 +728,8 @@ characters:
 | 115200 | ~21 ms |
 
 At 9600 that gap dominates. Raise `SERIAL_BAUD` in `Config.h` to 115200 for
-logging a fast sequence. Draining is deliberately the *last* thing
-`servicePending()` does, so the next cycle is already armed before any of it
-is spent.
+logging a fast sequence. With `VERBOSE 0` the `CYCLE <n>` line alone costs
+about 10 ms at 9600.
 
 **Resolution limit.** `micros()` has 4 µs granularity on a 16 MHz AVR, so every
 timestamp is a multiple of 4. The log cannot resolve a 1 µs delay even though
@@ -623,6 +749,8 @@ These were added and are all easy to strip:
 - `ABORT`/`STOP` — a laser controller needs a stop.
 - `CONFIRM_TIMEOUT` — a silent laser should not be able to wedge the sequence
   with `laser_enable` held high.
+- `CONFIRM_DEBOUNCE` — the confirm line is an edge input, and bring-up drives
+  it from a button. Defaults to 20 ms for that; zero it on rig install.
 - `PULSE` — the spec said `laser_signal` toggles low then high but not for how
   long, so the width is a guess made adjustable rather than a buried constant.
 - `STATUS` — bring-up is easier with a state read.
@@ -677,7 +805,7 @@ behind how it does it.
 |--------|-------|------------|
 | `Config.h/.cpp` | Pins, polarity, limits, firmware identity | — |
 | `Timer1.h/.cpp` | Durations, arming, the shutter output | Config |
-| `Settings.h/.cpp` | The six values `SET`/`GET` operate on | Timer1 |
+| `Settings.h/.cpp` | The seven values `SET`/`GET` operate on | Timer1 |
 | `LogRing.h/.cpp` | The verbose event ring, its drain, and the Timer5 log clock | Config, Settings |
 | `Sequence.h/.cpp` | The state machine and both ISRs | all of the above |
 | `Commands.h/.cpp` | The serial protocol, `HELP`, the banner | all of the above |
@@ -714,8 +842,10 @@ Two constraints the module boundaries introduce:
   `-flto`, which the Arduino AVR core does pass at compile and link — but it
   is now a property of the build flags rather than of the structure.
 
-The split cost nothing measurable: 16596 bytes of flash and 1167 of SRAM,
-against 16606 and 1167 for the same firmware as a single 1500-line file.
+The split cost nothing measurable. Measured at the time it was done: 16596
+bytes of flash and 1167 of SRAM, against 16606 and 1167 for the same firmware
+as a single 1500-line file. The tree has grown since — `--warnings all` reports
+the current figures on every build.
 
 ## Build
 

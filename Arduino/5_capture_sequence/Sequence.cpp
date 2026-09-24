@@ -23,6 +23,22 @@ static volatile TimerEvent Timer1Event = TIMER_NONE;
 // Set when a cycle begins, used to time out a missing laser_confirm.
 static volatile unsigned long ConfirmWaitStartedMs = 0;
 
+// HaveConfirmEdge keeps the first edge after boot from being measured against
+// a zero stamp, which would reject it while micros() is still small.
+static volatile unsigned long LastConfirmEdgeUs = 0;
+static volatile bool HaveConfirmEdge = false;
+
+// The line's level as read after the most recent edge. Once a bounce train
+// ends, that is the level the line settled at.
+static volatile uint8_t ConfirmSettledLevel = LOW;
+
+// digitalRead() costs microseconds; the port read costs a few cycles.
+static volatile uint8_t *ConfirmPinInput;
+static uint8_t ConfirmPinMask;
+
+// Taken in laserConfirmISR, logged from the compare ISR; see the call.
+static volatile uint16_t ConfirmLogTicks = 0;
+
 
 // Nothing prints from an ISR. At 9600 baud a byte costs 1.04 ms on the wire, so
 // a 40-character line is roughly 40 ms -- four orders of magnitude longer than
@@ -33,8 +49,6 @@ static volatile unsigned long ConfirmWaitStartedMs = 0;
 // camera input, pulses laser_signal with a blocking delay, and may need to
 // report an error. None of that belongs in an interrupt.
 
-static volatile bool PendingCycleStarted = false;
-static volatile uint16_t PendingCycleNumber = 0;
 static volatile bool PendingDone = false;
 static volatile bool PendingNextCycle = false;
 
@@ -47,23 +61,96 @@ static void logEvent(uint8_t event)
 }
 
 
-// The laser has acknowledged. Start the configured delay; when it expires the
-// Timer1 hardware toggles OC1A and the shutter gate opens with no software in
-// the path.
-void laserConfirmISR()
+static inline uint8_t readConfirmPin()
 {
-  if (State != WAITING_FOR_LASER_CONFIRM) {
-    return;
-  }
+  return (*ConfirmPinInput & ConfirmPinMask) ? HIGH : LOW;
+}
 
+
+// Start the configured delay; when it expires the Timer1 hardware sets OC1A
+// and the shutter gate opens with no software in the path. Forced inline so
+// the laser path pays no call overhead ahead of armTimer1().
+static inline __attribute__((always_inline)) void startDelay()
+{
   State = WAITING_FOR_DELAY;
 
   Timer1Event = TIMER_SHUTTER_OPEN;
 
+  // Timer1 is stopped here, so the mode can change before the window starts.
+  openShutterOnMatch();
+
   armTimer1(DelayTime);
 
-  // After arming, never before: the delay window starts at the line above.
-  logEvent(LOG_CONFIRM);
+  // Stamp only; the push waits for the compare ISR. Anything spent here
+  // delays that ISR, and so the capture re-arm, and so the close edge. Taken
+  // whether or not VERBOSE is on, so turning it on changes nothing here.
+  ConfirmLogTicks = readLogClock();
+}
+
+
+// A contact bounces on press *and* release, and each bounce train holds both
+// edge directions, so no single-edge interrupt can tell them apart: a FALLING
+// interrupt fires on both trains. This listens on CHANGE instead, so the quiet
+// is timed across every edge, and each train is judged by its first edge
+// against the level the line had settled at. The delay starts only on a train
+// that leaves DEBOUNCED_IDLE_LEVEL -- one per press, on the edge configured.
+static inline __attribute__((always_inline)) void debouncedConfirm()
+{
+  unsigned long now = micros();
+
+  // Unguarded read, sound for the same reason DelayTime's is; see Settings.h.
+  bool quiet = !HaveConfirmEdge || now - LastConfirmEdgeUs >= ConfirmDebounceUs;
+
+  // Stamped in every state, so edges during the cycle count as noise too.
+  LastConfirmEdgeUs = now;
+  HaveConfirmEdge = true;
+
+  if (State == WAITING_FOR_LASER_CONFIRM) {
+    if (quiet && ConfirmSettledLevel == DEBOUNCED_IDLE_LEVEL) {
+      startDelay();
+
+    } else if (!quiet) {
+      logEvent(LOG_CONFIRM_BOUNCE);
+    }
+  }
+
+  // After arming, so the read is no latency on delay_us.
+  ConfirmSettledLevel = readConfirmPin();
+}
+
+
+// The State guard rejects the bounce edges that land inside the cycle a
+// confirm started, but a cycle can finish in under 100 us, so later ones are
+// taken as the *next* cycle's confirm. ConfirmDebounceUs is the lockout. Gated
+// on non-zero so a laser pays nothing, not even the micros() read --
+// everything ahead of armTimer1() is latency on the front of delay_us.
+void laserConfirmISR()
+{
+  if (ConfirmDebounceUs > 0) {
+    debouncedConfirm();
+
+    return;
+  }
+
+  if (State != WAITING_FOR_LASER_CONFIRM) {
+    return;
+  }
+
+  startDelay();
+}
+
+
+void attachConfirmInterrupt()
+{
+  ConfirmPinInput = portInputRegister(digitalPinToPort(LASER_CONFIRM_PIN));
+  ConfirmPinMask = digitalPinToBitMask(LASER_CONFIRM_PIN);
+
+  ConfirmSettledLevel = readConfirmPin();
+  HaveConfirmEdge = false;
+
+  attachInterrupt(digitalPinToInterrupt(LASER_CONFIRM_PIN),
+                  laserConfirmISR,
+                  ConfirmDebounceUs > 0 ? CHANGE : LASER_CONFIRM_EDGE);
 }
 
 
@@ -79,6 +166,15 @@ ISR(TIMER1_COMPA_vect)
       Timer1Event = TIMER_SHUTTER_CLOSE;
 
       armTimer1(CaptureTime);
+
+      // After arming, never before: the delay window may still be matching,
+      // and in clear mode one more match would close the gate early.
+      closeShutterOnMatch();
+
+      // Both windows are in hardware now, so logging costs no edge. The
+      // confirm was one delay_us ago, plus ISR latency the unwrap absorbs.
+      logEventAt(LOG_CONFIRM, CurrentCycle + 1, ConfirmLogTicks,
+                 DelayTime.actualUs);
 
       logEvent(LOG_SHUTTER_OPEN);
 
@@ -112,9 +208,9 @@ ISR(TIMER1_COMPA_vect)
       break;
 
     // A match nobody asked for. The timer is running with no transition
-    // expected, so it is free-running in CTC and will keep toggling the gate
-    // every OCR1A. Whatever re-armed it did so behind the state machine; shut
-    // it down and close the shutter rather than leave the pin flapping.
+    // expected, so it is free-running in CTC and matching every OCR1A.
+    // Whatever re-armed it did so behind the state machine; shut it down and
+    // close the shutter rather than trust whichever mode it was left in.
     default:
       stopTimer1();
 
@@ -130,7 +226,7 @@ ISR(TIMER1_COMPA_vect)
 // whenever it finds State still set to WAITING_FOR_LASER_CONFIRM. Tearing down
 // with interrupts on leaves a window between stopTimer1() and State = IDLE
 // where a late confirm edge starts the timer back up behind us. Nothing stops
-// it after that, so the delay expires, the hardware toggles the gate open, and
+// it after that, so the delay expires, the hardware sets the gate open, and
 // the compare ISR finds no pending event and does nothing -- shutter held open
 // with the state machine reporting IDLE.
 //
@@ -157,12 +253,18 @@ void abortSequence()
 }
 
 
-// Checks the camera, then fires the laser signal pulse. Called from loop()
-// only, never from an ISR.
+// Checks the camera, writes everything the cycle has to say, then fires the
+// laser signal pulse. Called from loop() only, never from an ISR.
+//
+// All serial output for a cycle goes out, and is flushed, before the pulse.
+// Bytes still leaving once the laser can answer run the USART interrupt, and
+// a confirm edge landing on one waits a few us for it -- latency on the open
+// edge. The cost is turnaround: the cycle waits for the wire, about 10 ms for
+// the CYCLE line at 9600 and a quarter second with VERBOSE on.
 //
 // Returns false if the cycle could not start, having already aborted the
 // sequence and reported why.
-static bool beginCycle()
+static bool beginCycle(bool announceStart)
 {
   if (digitalRead(CAMERA_CAPTURING_PIN) != CAMERA_ACTIVE_LEVEL) {
     abortSequence();
@@ -172,14 +274,25 @@ static bool beginCycle()
     return false;
   }
 
+  if (VerboseEnabled) {
+    drainLog();
+  }
+
+  if (announceStart) {
+    Serial.println("STARTED");
+  }
+
+  Serial.print("CYCLE ");
+  Serial.println(CurrentCycle + 1);
+
+  Serial.flush();
+
   // Arm before pulsing. If the laser answers immediately, the confirm
-  // interrupt must already see the right state or the edge is lost.
+  // interrupt must already see the right state or the edge is lost. After
+  // the flush, not before, so a stray edge cannot start a cycle unfired.
   State = WAITING_FOR_LASER_CONFIRM;
 
   ConfirmWaitStartedMs = millis();
-
-  PendingCycleNumber = CurrentCycle + 1;
-  PendingCycleStarted = true;
 
   logEvent(LOG_CYCLE_BEGIN);
 
@@ -221,11 +334,9 @@ void startSequence()
 
   digitalWrite(LASER_ENABLE_PIN, HIGH);
 
-  // Announce only once the first cycle is actually underway, so a camera
-  // failure reports the error alone rather than STARTED followed by ERROR.
-  if (beginCycle()) {
-    Serial.println("STARTED");
-  }
+  // STARTED is written by beginCycle() once the camera check passes, so a
+  // camera failure reports the error alone rather than STARTED then ERROR.
+  beginCycle(true);
 }
 
 
@@ -239,28 +350,19 @@ bool isRunning()
 
 void servicePending()
 {
-  // Arm the next cycle before printing anything. Serial writes are slow
-  // enough to show up as inter-cycle jitter if they happen first.
   if (PendingNextCycle) {
     PendingNextCycle = false;
 
-    beginCycle();
+    beginCycle(false);
   }
 
-  if (PendingCycleStarted) {
-    noInterrupts();
-
-    uint16_t cycle = PendingCycleNumber;
-    PendingCycleStarted = false;
-
-    interrupts();
-
-    Serial.print("CYCLE ");
-    Serial.println(cycle);
-  }
-
+  // The log first, so DONE stays the last line of a run.
   if (PendingDone) {
     PendingDone = false;
+
+    if (VerboseEnabled) {
+      drainLog();
+    }
 
     Serial.println("DONE");
   }
@@ -274,9 +376,8 @@ void servicePending()
     Serial.println("ERROR LASER CONFIRM TIMEOUT");
   }
 
-  // Last, so the next cycle is already armed before we spend time on the
-  // serial write.
-  if (VerboseEnabled) {
+  // Between runs only. During one, beginCycle() drains ahead of the pulse.
+  if (VerboseEnabled && !isRunning()) {
     drainLog();
   }
 }

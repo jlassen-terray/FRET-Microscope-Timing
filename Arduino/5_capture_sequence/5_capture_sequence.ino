@@ -9,9 +9,9 @@
 //     pulse laser_signal LOW then HIGH
 //     wait for laser_confirm
 //     wait delay_us            <- Timer1
-//     assert shutter_enable    <- Timer1 hardware toggle
+//     assert shutter_enable    <- Timer1 hardware set
 //     wait capture_us          <- Timer1
-//     release shutter_enable   <- Timer1 hardware toggle
+//     release shutter_enable   <- Timer1 hardware clear
 //
 // laser_enable is raised once when the sequence starts and dropped when it
 // finishes or aborts.
@@ -30,7 +30,7 @@
 //
 //     Config      pins, polarity, limits, firmware identity
 //     Timer1      durations, arming, the shutter output
-//     Settings    the six values SET and GET operate on
+//     Settings    the seven values SET and GET operate on
 //     LogRing     the verbose event ring, its drain, and the log clock
 //     Sequence    the state machine and the two ISRs
 //     Commands    the serial protocol, HELP, and the banner
@@ -58,7 +58,7 @@ void setup()
   Serial.begin(SERIAL_BAUD);
 
   pinMode(CAMERA_CAPTURING_PIN, INPUT);
-  pinMode(LASER_CONFIRM_PIN, INPUT);
+  pinMode(LASER_CONFIRM_PIN, LASER_CONFIRM_INPUT_MODE);
 
   // Write before pinMode, and again after, so the pin never glitches to the
   // wrong level as it switches from input to output.
@@ -78,8 +78,8 @@ void setup()
   TCCR1B = 0;
   TCNT1 = 0;
 
-  // COM1A0: toggle OC1A on every compare match.
-  TCCR1A = (1 << COM1A0);
+  // Connect OC1A to the pin, idle in clear mode.
+  closeShutterOnMatch();
 
   // Enable the Compare A interrupt. Without this the sequence cannot advance.
   TIMSK1 = (1 << OCIE1A);
@@ -94,11 +94,7 @@ void setup()
   resolveDuration(1, DelayTime);
   resolveDuration(50, CaptureTime);
 
-  attachInterrupt(
-      digitalPinToInterrupt(LASER_CONFIRM_PIN),
-      laserConfirmISR,
-      LASER_CONFIRM_EDGE
-  );
+  attachConfirmInterrupt();
 
   // Banner first, then READY. READY stays the last line of boot output, which
   // is what a host waits for.

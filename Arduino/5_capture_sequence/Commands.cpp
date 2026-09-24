@@ -53,6 +53,15 @@ static String getConfirmTimeoutResponseString()
   return String("OK CONFIRM_TIMEOUT ") + ConfirmTimeoutMs + "ms";
 }
 
+static String getConfirmDebounceResponseString()
+{
+  if (ConfirmDebounceUs == 0) {
+    return String("OK CONFIRM_DEBOUNCE 0 (disabled)");
+  }
+
+  return String("OK CONFIRM_DEBOUNCE ") + ConfirmDebounceUs + "us";
+}
+
 
 // Only the commands that take an argument need a constant, since those are
 // matched with startsWith() and the length is used to slice the argument off.
@@ -72,6 +81,9 @@ static const String SET_PULSE_COMMAND = "SET PULSE";
 
 static const String GET_CONFIRM_TIMEOUT_COMMAND = "GET CONFIRM_TIMEOUT";
 static const String SET_CONFIRM_TIMEOUT_COMMAND = "SET CONFIRM_TIMEOUT";
+
+static const String GET_CONFIRM_DEBOUNCE_COMMAND = "GET CONFIRM_DEBOUNCE";
+static const String SET_CONFIRM_DEBOUNCE_COMMAND = "SET CONFIRM_DEBOUNCE";
 
 static const String GET_VERBOSE_COMMAND = "GET VERBOSE";
 static const String SET_VERBOSE_COMMAND = "SET VERBOSE";
@@ -246,13 +258,17 @@ static void printHelp()
                  String(MIN_CONFIRM_TIMEOUT_MS) + "-" + MAX_CONFIRM_TIMEOUT_MS + "ms",
                  F("confirm wait, 0 disables"));
 
+  printHelpField(F("SET CONFIRM_DEBOUNCE <us>"),
+                 String(MIN_CONFIRM_DEBOUNCE_US) + "-" + MAX_CONFIRM_DEBOUNCE_US + "us",
+                 F("contact lockout, 0 disables"));
+
   printHelpField(F("SET VERBOSE <0|1>"),
                  String("0-1"),
                  F("measured event log"));
 
   Serial.println();
 
-  Serial.println(F("  GET reads back any of the six settings, e.g. GET DELAY."));
+  Serial.println(F("  GET reads back any of the seven settings, e.g. GET DELAY."));
   Serial.println(F("  SET, HELP and INFO are rejected with ERROR BUSY while running."));
 
   Serial.println(F("OK HELP END"));
@@ -293,7 +309,7 @@ static void printBannerRow(const __FlashStringHelper *name, const String &value)
 
 static void printBannerPin(const __FlashStringHelper *name,
                            uint8_t pin,
-                           const __FlashStringHelper *note)
+                           const String &note)
 {
   String line = String("    ") + name;
 
@@ -327,6 +343,23 @@ static void printMicroscope()
   Serial.println(F("       /_______________\\"));
 }
 
+// Built from the constants and CONFIRM_DEBOUNCE, so the banner cannot claim a
+// bias or an edge the sketch is not using.
+static String describeConfirmPin()
+{
+  String note = LASER_CONFIRM_INPUT_MODE == INPUT_PULLUP
+                    ? String(F("input pullup, "))
+                    : String(F("input, "));
+
+  if (ConfirmDebounceUs > 0) {
+    return note + F("debounced, delay from ") +
+           (DEBOUNCED_IDLE_LEVEL == HIGH ? F("FALLING") : F("RISING"));
+  }
+
+  return note + F("interrupt on ") +
+         (LASER_CONFIRM_EDGE == FALLING ? F("FALLING") : F("RISING"));
+}
+
 void printBanner()
 {
   Serial.println(F("INFO"));
@@ -352,8 +385,7 @@ void printBanner()
   printBannerPin(F("laser_signal"), LASER_SIGNAL_PIN,
                  F("output, idles HIGH, pulses LOW"));
 
-  printBannerPin(F("laser_confirm"), LASER_CONFIRM_PIN,
-                 F("input, interrupt on RISING"));
+  printBannerPin(F("laser_confirm"), LASER_CONFIRM_PIN, describeConfirmPin());
 
   printBannerPin(F("camera_capturing"), CAMERA_CAPTURING_PIN,
                  F("input, active HIGH"));
@@ -373,6 +405,10 @@ void printBanner()
   printBannerRow(F("CONFIRM_TIMEOUT"),
                  ConfirmTimeoutMs == 0 ? String("0 (disabled)")
                                        : String(ConfirmTimeoutMs) + "ms");
+
+  printBannerRow(F("CONFIRM_DEBOUNCE"),
+                 ConfirmDebounceUs == 0 ? String("0 (disabled)")
+                                        : String(ConfirmDebounceUs) + "us");
 
   printBannerRow(F("VERBOSE"), VerboseEnabled ? F("1 (event log on)") : F("0"));
 
@@ -491,6 +527,12 @@ void processCommand(String command)
     return;
   }
 
+  if (command == GET_CONFIRM_DEBOUNCE_COMMAND) {
+    Serial.println(getConfirmDebounceResponseString());
+
+    return;
+  }
+
   if (command == GET_VERBOSE_COMMAND) {
     Serial.println(getVerboseResponseString());
 
@@ -555,6 +597,22 @@ void processCommand(String command)
         ConfirmTimeoutMs = value;
 
         Serial.println(getConfirmTimeoutResponseString());
+      }
+
+      return;
+    }
+
+    if (command.startsWith(SET_CONFIRM_DEBOUNCE_COMMAND)) {
+      unsigned long value;
+
+      if (parseScalarArg(command.substring(SET_CONFIRM_DEBOUNCE_COMMAND.length()),
+                         "CONFIRM_DEBOUNCE",
+                         MIN_CONFIRM_DEBOUNCE_US, MAX_CONFIRM_DEBOUNCE_US, value)) {
+        ConfirmDebounceUs = value;
+
+        attachConfirmInterrupt();
+
+        Serial.println(getConfirmDebounceResponseString());
       }
 
       return;

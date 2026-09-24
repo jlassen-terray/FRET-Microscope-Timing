@@ -39,6 +39,11 @@ String durationDetail(const Duration &d);
 void armTimer1(const Duration &d);
 void stopTimer1();
 
+// What the next compare match does to the shutter gate. Set and clear rather
+// than toggle; see the comment on the definition.
+void openShutterOnMatch();
+void closeShutterOnMatch();
+
 // Force the shutter gate back to released. See the comment on the definition
 // for why writing the port will not do it.
 void resetShutter();

@@ -1,14 +1,15 @@
 // ============================================================================
 // RUNTIME SETTINGS
 //
-// The six values SET writes and GET reads back. They are grouped because they
-// share one invariant, and that invariant is what makes the rest of the
+// The seven values SET writes and GET reads back. They are grouped because
+// they share one invariant, and that invariant is what makes the rest of the
 // firmware safe:
 //
 //     SET is rejected with ERROR BUSY while a sequence is running.
 //
 // The Timer1 compare ISR reads DelayTime, CaptureTime and CycleCount with no
-// volatile and no interrupt guards. That is only sound because the parser
+// volatile and no interrupt guards, and laserConfirmISR reads
+// ConfirmDebounceUs the same way. That is only sound because the parser
 // refuses to write them mid-run, so there is never a concurrent write to
 // tear. Relax the BUSY rule and these need rethinking.
 //
@@ -32,6 +33,7 @@ extern Duration CaptureTime;        // SET CAPTURE <us>
 extern uint16_t CycleCount;         // SET CYCLE_COUNT <n>
 extern unsigned long LaserSignalPulseUs;  // SET PULSE <us>
 extern unsigned long ConfirmTimeoutMs;    // SET CONFIRM_TIMEOUT <ms>
+extern unsigned long ConfirmDebounceUs;   // SET CONFIRM_DEBOUNCE <us>
 extern bool VerboseEnabled;               // SET VERBOSE <0|1>
 
 #endif
