@@ -24,3 +24,6 @@ desktop.ini
 
 # Arbitrary
 Peter-Reference/
+
+# Claude Code worktrees (embedded git repos, not for committing)
+.claude/worktrees/
