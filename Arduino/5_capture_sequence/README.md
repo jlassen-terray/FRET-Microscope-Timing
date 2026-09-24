@@ -35,8 +35,8 @@ are INT0=21, INT1=20, INT2=19, INT3=18, INT4=2, INT5=3.
 
 Inputs are treated as **active-high and push-pull**. If a source is
 open-collector, switch it to `INPUT_PULLUP`, flip `CAMERA_ACTIVE_LEVEL`, and
-set `LASER_CONFIRM_EDGE` to `FALLING` — all three are constants at the top of
-the sketch.
+set `LASER_CONFIRM_EDGE` to `FALLING` — the latter two are in `Config.h`, the
+`pinMode` call is in `setup()`.
 
 ## Wiring
 
@@ -292,8 +292,8 @@ banner described under [Boot banner](#boot-banner) and then `READY`. `READY` is
 still the last line of boot output, so a host that waits for it needs no
 changes.
 
-Baud is `SERIAL_BAUD` at the top of the sketch — raise it to 115200 if you
-intend to use verbose logging.
+Baud is `SERIAL_BAUD` in `Config.h` — raise it to 115200 if you intend to use
+verbose logging.
 
 | Command | Range | Default | Meaning |
 |---------|-------|---------|---------|
@@ -391,8 +391,9 @@ Four things in there earn their place:
 
 - **`built`** is stamped by the compiler from `__DATE__` and `__TIME__`, so the
   banner settles "is the board actually running my latest upload?" without a
-  round trip. One caveat: a cached build is not recompiled, so an unchanged
-  sketch keeps its earlier stamp. Touch the file or clean the build if the
+  round trip. Read it as the compile time of `5_capture_sequence.ino` rather
+  than of the binary: the build caches per file, so editing only `Sequence.cpp`
+  leaves the stamp at its earlier value. Build with `--clean` when the
   timestamp has to be trustworthy.
 - **Pins** are printed from the same constants the sketch wires up, so the
   banner cannot describe a pinout the firmware is not using.
@@ -412,11 +413,10 @@ reset under it.
 reason `HELP` is: at 9600 baud the block takes roughly a second to clock out,
 and `loop()` is what starts each next cycle.
 
-Identity lives in `FIRMWARE_NAME` and `FIRMWARE_VERSION` at the top of the
-sketch. Both are `PROGMEM`, as is every fixed string in the banner, so the
-whole thing costs about 2.1 kB of flash and no meaningful SRAM. Bump
-`FIRMWARE_VERSION` when the protocol changes, since that is what a host would
-gate its behaviour on.
+Identity lives in `FIRMWARE_NAME` and `FIRMWARE_VERSION` in `Config.cpp`. Both
+are `PROGMEM`, as is every fixed string in the banner, so the whole thing costs
+about 2.1 kB of flash and no meaningful SRAM. Bump `FIRMWARE_VERSION` when the
+protocol changes, since that is what a host would gate its behaviour on.
 
 ### Responses
 
@@ -531,8 +531,8 @@ characters:
 | 38400 | ~52 ms |
 | 115200 | ~17 ms |
 
-At 9600 that gap dominates. Raise `SERIAL_BAUD` at the top of the sketch to
-115200 for logging a fast sequence. Draining is deliberately the *last* thing
+At 9600 that gap dominates. Raise `SERIAL_BAUD` in `Config.h` to 115200 for
+logging a fast sequence. Draining is deliberately the *last* thing
 `servicePending()` does, so the next cycle is already armed before any of it
 is spent.
 
@@ -598,8 +598,61 @@ but it is unreachable: /256 already covers the full range up to `MAX_US`.
 Timer1's CTC mode counts `0..OCR1A` inclusive, so the register is loaded with
 one less than the tick count shown above.
 
+## Source layout
+
+Six modules, each a header and an implementation file. The header is the
+interface and says what the module is for; the `.cpp` carries the reasoning
+behind how it does it.
+
+| Module | Holds | Depends on |
+|--------|-------|------------|
+| `Config.h/.cpp` | Pins, polarity, limits, firmware identity | — |
+| `Timer1.h/.cpp` | Durations, arming, the shutter output | Config |
+| `Settings.h/.cpp` | The six values `SET`/`GET` operate on | Timer1 |
+| `LogRing.h/.cpp` | The verbose event ring and its drain | Settings |
+| `Sequence.h/.cpp` | The state machine and both ISRs | all of the above |
+| `Commands.h/.cpp` | The serial protocol, `HELP`, the banner | all of the above |
+
+`5_capture_sequence.ino` keeps only the overview, the build stamp, `setup()`
+and `loop()`.
+
+Dependencies run in one direction, so the stack reads bottom-up: `Config`
+depends on nothing, `Commands` sits on top of everything. These are real
+translation units rather than Arduino tabs, so each `.cpp` includes what it
+needs and compiles on its own — file order and declaration order carry no
+meaning, and moving something cannot break the build the way it can in a
+multi-tab sketch.
+
+Each module keeps its internals `static`, so the only names crossing a file
+boundary are the ones a header declares. What that hides is most of the
+firmware: the pending-work flags and the confirm-wait deadline are visible
+only inside `Sequence.cpp`, the ring buffer and its indices only inside
+`LogRing.cpp`, and the whole of the parsing and column-formatting machinery
+only inside `Commands.cpp`, which exposes three functions.
+
+`resolveDuration()` in `Timer1.cpp` is the one function worth testing on a
+host: no registers, no globals, pure arithmetic over the constants in
+`Config.h` — and it owns both the prescaler selection and the CTC off-by-one.
+
+Two constraints the module boundaries introduce:
+
+- **The build stamp can go stale.** The build caches per file, so the banner's
+  `built` line is the compile time of `5_capture_sequence.ino` rather than of
+  the binary. See [Boot banner](#boot-banner).
+- **Cross-module inlining rests on LTO.** `armTimer1()` is called from both
+  ISRs and `logEventForCycle()` is meant to cost a few dozen cycles. Within a
+  single file the compiler inlined both for free; across files it needs
+  `-flto`, which the Arduino AVR core does pass at compile and link — but it
+  is now a property of the build flags rather than of the structure.
+
+The split cost nothing measurable: 16596 bytes of flash and 1167 of SRAM,
+against 16606 and 1167 for the same firmware as a single 1500-line file.
+
 ## Build
 
 ```
 arduino-cli compile --fqbn arduino:avr:mega . --warnings all
 ```
+
+`--warnings all` is the only automated check this sketch has; it builds clean.
+Add `--clean` when the banner's `built` timestamp needs to be accurate.
