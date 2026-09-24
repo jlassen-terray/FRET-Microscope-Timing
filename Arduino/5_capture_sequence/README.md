@@ -176,7 +176,8 @@ closing and the next cycle arming. And a `confirm_timeout` of `0` removes the
 ## Commands
 
 9600 baud, newline-terminated, case-insensitive. The sketch prints `READY`
-once on boot.
+once on boot. Baud is `SERIAL_BAUD` at the top of the sketch — raise it to
+115200 if you intend to use verbose logging.
 
 | Command | Range | Default | Meaning |
 |---------|-------|---------|---------|
@@ -185,6 +186,7 @@ once on boot.
 | `SET CYCLE_COUNT <n>` / `GET CYCLE_COUNT` | 1–65535 | 1 | iterations per `START` |
 | `SET PULSE <us>` / `GET PULSE` | 1–16383 µs | 10 | laser_signal low-pulse width |
 | `SET CONFIRM_TIMEOUT <ms>` / `GET CONFIRM_TIMEOUT` | 0–600000 ms | 5000 | **0 disables** |
+| `SET VERBOSE <0\|1>` / `GET VERBOSE` | 0–1 | 0 | Event logging, see below |
 | `START` | — | — | Runs the sequence |
 | `ABORT` (or `STOP`) | — | — | Drops laser_enable, releases the shutter |
 | `STATUS` | — | — | State, cycle progress, live camera level |
@@ -202,6 +204,7 @@ OK CYCLE_COUNT 2
 OK PULSE 25us
 OK CONFIRM_TIMEOUT 5000ms
 OK CONFIRM_TIMEOUT 0 (disabled)
+OK VERBOSE 1
 OK ABORTED
 OK STATUS IDLE CYCLE 0/2 CAMERA IDLE
 ```
@@ -252,6 +255,72 @@ The `RANGE` message appends `us` for `DELAY` and `CAPTURE`
 (`ERROR DELAY RANGE 1-1000000us`) and is unitless for the rest
 (`ERROR PULSE RANGE 1-16383`).
 
+## Verbose logging
+
+`SET VERBOSE 1` turns on an event log that reports what the hardware actually
+did, with measured intervals. Set it before `START` — like every other `SET`,
+it is refused while a sequence is running.
+
+```
+V 1 CYCLE_BEGIN t=1048576
+V 1 PULSE t=1048588 +12
+V 1 CONFIRM t=1048712 +124
+V 1 SHUTTER_OPEN t=1048912 +200
+V 1 SHUTTER_CLOSE t=1049412 +500
+V 2 CYCLE_BEGIN t=1049640 +228
+V 2 PULSE t=1049652 +12
+V 2 CONFIRM t=1049776 +124
+V 2 SHUTTER_OPEN t=1049976 +200
+V 2 SHUTTER_CLOSE t=1050476 +500
+V 2 DONE t=1050480 +4
+```
+
+Format is `V <cycle> <EVENT> t=<micros> +<delta>`. The `V ` prefix keeps these
+lines separable from command responses. The `+` column — the gap since the
+previous event — is the useful one:
+
+| Gap | Measures |
+|-----|----------|
+| `CYCLE_BEGIN` → `PULSE` | laser_signal pulse width (`pulse_us`) |
+| `PULSE` → `CONFIRM` | the laser's own response time |
+| `CONFIRM` → `SHUTTER_OPEN` | `delay_us` as actually produced |
+| `SHUTTER_OPEN` → `SHUTTER_CLOSE` | `capture_us` as actually produced |
+| `SHUTTER_CLOSE` → next `CYCLE_BEGIN` | inter-cycle turnaround |
+
+### Does it affect the timing?
+
+**Not the hardware windows.** `delay_us` and `capture_us` are produced by the
+Timer1 compare output. Events are captured into a 32-entry ring buffer —
+a `micros()` read and a few stores — and every `logEvent()` call is placed
+*after* the timer registers have been written, so no edge ever waits on it.
+Formatting and the serial write happen later, in `loop()`. The pulse itself is
+bracketed so no log call can land between its two edges and widen it.
+
+**Yes, the inter-cycle gap.** Draining the log is a blocking serial write, and
+the next cycle is armed from `loop()`. A verbose cycle is roughly 200
+characters:
+
+| Baud | Per cycle |
+|------|-----------|
+| 9600 | ~208 ms |
+| 38400 | ~52 ms |
+| 115200 | ~17 ms |
+
+At 9600 that gap dominates. Raise `SERIAL_BAUD` at the top of the sketch to
+115200 for logging a fast sequence. Draining is deliberately the *last* thing
+`servicePending()` does, so the next cycle is already armed before any of it
+is spent.
+
+**Resolution limit.** `micros()` has 4 µs granularity on a 16 MHz AVR, so every
+timestamp is a multiple of 4. The log cannot resolve a 1 µs delay even though
+the hardware produces it exactly. Treat it as an observation of the timing, not
+a measurement of it — a scope is still the instrument for sub-4 µs work.
+
+**Overflow is reported, not hidden.** If cycles outrun the serial link the ring
+fills, and further events are counted and dropped rather than blocking an ISR.
+The count surfaces as `V LOG_DROPPED <n>`, so a gap in the log is always
+visible as a gap.
+
 ### Beyond the original spec
 
 The spec called for `delay_us`, `capture_us`, `cycle_count`, and `START`.
@@ -263,6 +332,7 @@ These were added and are all easy to strip:
 - `PULSE` — the spec said `laser_signal` toggles low then high but not for how
   long, so the width is a guess made adjustable rather than a buried constant.
 - `STATUS` — bring-up is easier with a state read.
+- `VERBOSE` — measured event log; see above for its timing cost.
 - The prescaler selection, which extends `delay_us` and `capture_us` past the
   4096 µs a fixed unprescaled Timer1 would cap them at.
 
