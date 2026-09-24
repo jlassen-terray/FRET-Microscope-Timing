@@ -188,9 +188,47 @@ once on boot.
 | `START` | — | — | Runs the sequence |
 | `ABORT` (or `STOP`) | — | — | Drops laser_enable, releases the shutter |
 | `STATUS` | — | — | State, cycle progress, live camera level |
+| `HELP` (or `?`) | — | — | Lists every command |
 
 `SET PULSE` is the runtime control for `LaserSignalPulseUs`;
 `SET CONFIRM_TIMEOUT` for `ConfirmTimeoutMs`.
+
+### HELP
+
+`HELP` (or `?`) prints the table above from the firmware itself, with the
+limits built from the same constants the parser enforces, so it cannot drift
+out of step with the build actually on the board:
+
+```
+> HELP
+OK HELP
+  START                     run CYCLE_COUNT cycles
+  ABORT | STOP              stop, drop laser_enable, free shutter
+  STATUS                    state, cycle progress, camera level
+  HELP | ?                  this list
+
+  SET DELAY <us>            1-1000000us   laser_confirm to shutter open
+  SET CAPTURE <us>          1-1000000us   shutter gate width
+  SET CYCLE_COUNT <n>       1-65535       cycles per START
+  SET PULSE <us>            1-16383us     laser_signal low-pulse width
+  SET CONFIRM_TIMEOUT <ms>  0-600000ms    confirm wait, 0 disables
+
+  GET reads back any of the five settings, e.g. GET DELAY.
+  SET and HELP are rejected with ERROR BUSY while running.
+OK HELP END
+```
+
+This is the one multi-line response in the protocol. Every body line is
+indented by two spaces and the block is bracketed by `OK HELP` and
+`OK HELP END`, so a host reading line by line can swallow everything between
+the two markers without parsing the entries.
+
+`HELP` is rejected with `ERROR BUSY` while a sequence is running, for a
+different reason than `SET` is. The block is roughly 700 bytes — about 700 ms
+at 9600 baud once the 64-byte transmit buffer backs up — and `loop()` is what
+starts each next cycle, so printing it mid-run would stretch the gap between
+cycles. The text is stored in flash with `F()`; in RAM it would cost a tenth of
+the Mega's SRAM.
 
 ### Responses
 
@@ -241,7 +279,7 @@ consistent behaviour.
 | Error | Cause |
 |-------|-------|
 | `ERROR UNKNOWN COMMAND` | Unrecognised input |
-| `ERROR BUSY` | `START` or any `SET` while a sequence is running |
+| `ERROR BUSY` | `START`, `HELP`, or any `SET` while a sequence is running |
 | `ERROR CAMERA NOT CAPTURING` | `camera_capturing` low at the start of any cycle; sequence aborts |
 | `ERROR LASER CONFIRM TIMEOUT` | No `laser_confirm` within `confirm_timeout`; sequence aborts |
 | `ERROR <FIELD> VALUE` | Argument is not a plain non-negative integer |
@@ -263,6 +301,9 @@ These were added and are all easy to strip:
 - `PULSE` — the spec said `laser_signal` toggles low then high but not for how
   long, so the width is a guess made adjustable rather than a buried constant.
 - `STATUS` — bring-up is easier with a state read.
+- `HELP`/`?` — the command set has grown past what is worth remembering at a
+  serial monitor, and quoting the limits from the constants means the board
+  documents itself.
 - The prescaler selection, which extends `delay_us` and `capture_us` past the
   4096 µs a fixed unprescaled Timer1 would cap them at.
 
