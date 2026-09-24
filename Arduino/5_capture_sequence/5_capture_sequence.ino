@@ -386,7 +386,13 @@ volatile uint8_t LogDropped = 0;
 
 
 // Safe from any context. Costs a few dozen cycles.
-void logEvent(uint8_t event)
+//
+// The cycle number is passed in rather than derived, because CurrentCycle
+// means different things either side of the increment in the shutter-close
+// ISR: before it, the cycle in progress is CurrentCycle + 1; after it, the
+// cycle that just finished is CurrentCycle. logEvent() covers the common
+// case and DONE uses logEventForCycle() directly.
+void logEventForCycle(uint8_t event, uint16_t cycle)
 {
   if (!VerboseEnabled) {
     return;
@@ -411,7 +417,7 @@ void logEvent(uint8_t event)
 
   } else {
     LogRing[LogHead].timestampUs = now;
-    LogRing[LogHead].cycle = CurrentCycle + 1;
+    LogRing[LogHead].cycle = cycle;
     LogRing[LogHead].event = event;
 
     LogHead = next;
@@ -420,6 +426,19 @@ void logEvent(uint8_t event)
   SREG = sreg;
 }
 
+
+void logEvent(uint8_t event)
+{
+  logEventForCycle(event, CurrentCycle + 1);
+}
+
+
+// The "+" column is a gap between two consecutive drained events, so the
+// drain side carries state of its own. It has to be cleared here too, or the
+// first event of a run reports the gap since the *previous* run's last event
+// -- an interval that measures nothing and can be arbitrarily large.
+unsigned long LogLastUs = 0;
+bool LogHaveLast = false;
 
 void resetLog()
 {
@@ -431,6 +450,8 @@ void resetLog()
   LogDropped = 0;
 
   SREG = sreg;
+
+  LogHaveLast = false;
 }
 
 
@@ -448,9 +469,6 @@ void resetLog()
 
 void drainLog()
 {
-  static unsigned long lastUs = 0;
-  static bool haveLast = false;
-
   while (LogTail != LogHead) {
     uint8_t sreg = SREG;
     cli();
@@ -485,15 +503,15 @@ void drainLog()
     Serial.print(F(" t="));
     Serial.print(entry.timestampUs);
 
-    if (haveLast) {
+    if (LogHaveLast) {
       Serial.print(F(" +"));
-      Serial.print(entry.timestampUs - lastUs);
+      Serial.print(entry.timestampUs - LogLastUs);
     }
 
     Serial.println();
 
-    lastUs = entry.timestampUs;
-    haveLast = true;
+    LogLastUs = entry.timestampUs;
+    LogHaveLast = true;
   }
 
   if (LogDropped > 0) {
@@ -688,7 +706,9 @@ ISR(TIMER1_COMPA_vect)
 
         digitalWrite(LASER_ENABLE_PIN, LOW);
 
-        logEvent(LOG_DONE);
+        // CurrentCycle has already been incremented, so it is now the number
+        // of the cycle that just finished -- which is the one DONE belongs to.
+        logEventForCycle(LOG_DONE, CurrentCycle);
 
         PendingDone = true;
 
