@@ -25,6 +25,8 @@ technique and [sketch 3](../3_serial_config) for the serial command interface.
 | `laser_signal` | 9 | out | HIGH |
 | `shutter_enable` | 11 (OC1A) | out | LOW |
 
+The [signal map](#signal-map) below shows how these five orchestrate a cycle.
+
 `shutter_enable` must stay on pin 11 — it is the Timer1 Compare A output, and
 that is what produces the gate edges in hardware.
 
@@ -108,6 +110,116 @@ flowchart LR
 
 Note the optoisolated form inverts the signal and needs a pull-up, so it is the
 `INPUT_PULLUP` / `FALLING` configuration described under Signals.
+
+## Signal map
+
+A cycle is a closed loop that leaves the board on `laser_signal`, comes back
+on `laser_confirm`, and only then lets Timer1 place the shutter gate. The two
+inputs play different roles: `laser_confirm` is an **edge** that advances the
+sequence, `camera_capturing` is a **level** that gates it. Of the outputs,
+`laser_enable` is held for the whole run, `laser_signal` is a short pulse per
+cycle, and `shutter_enable` is the one deliverable the whole thing exists to
+place.
+
+Solid arrows are edges that drive the sequence forward; dotted arrows are
+levels sampled and timeouts — conditions rather than events. The two
+thick-bordered nodes are transitions the hardware produces with no software in
+the path.
+
+```mermaid
+flowchart TB
+    HOST(["Host serial"])
+    CAMERA(["Camera"])
+    LASER(["Laser controller"])
+    SHUTTER(["Shutter / gate driver"])
+
+    subgraph MEGA["Arduino Mega 2560"]
+        direction TB
+
+        EN["laser_enable HIGH<br/>pin 8, held for the whole run"]
+        GATE{"camera_capturing<br/>HIGH?"}
+        PULSE["laser_signal HIGH → LOW → HIGH<br/>pin 9, loop() blocks pulse_us"]
+        ARM["arm Timer1 with delay_us<br/>laserConfirmISR()"]
+        OPEN["OC1A toggles HIGH<br/>shutter_enable opens"]
+        REARM["arm Timer1 with capture_us<br/>TIMER1_COMPA ISR"]
+        CLOSE["OC1A toggles LOW<br/>shutter_enable closes"]
+        MORE{"cycles<br/>remain?"}
+        OFF["laser_enable LOW<br/>pin 8"]
+        ERRC["ERROR CAMERA<br/>NOT CAPTURING"]
+        ERRL["ERROR LASER<br/>CONFIRM TIMEOUT"]
+    end
+
+    HOST -->|"START"| EN
+    EN --> GATE
+    CAMERA -.->|"pin 3, sampled once per cycle"| GATE
+    GATE -->|"no"| ERRC
+    GATE -->|"yes"| PULSE
+    PULSE -->|"pin 9, 5V TTL"| LASER
+    LASER -->|"pin 2, rising edge"| ARM
+    LASER -.->|"silent past confirm_timeout"| ERRL
+    ARM -->|"delay_us elapses"| OPEN
+    OPEN -->|"pin 11, 5V TTL"| SHUTTER
+    OPEN --> REARM
+    REARM -->|"capture_us elapses"| CLOSE
+    CLOSE -->|"pin 11, 5V TTL"| SHUTTER
+    CLOSE --> MORE
+    MORE -->|"yes"| GATE
+    MORE -->|"no"| OFF
+    OFF -->|"DONE"| HOST
+    ERRC --> HOST
+    ERRL --> HOST
+
+    classDef hw stroke-width:3px
+    class OPEN,CLOSE hw
+```
+
+Reading the loop as responsibilities rather than as a path:
+
+| Signal | Who drives the edge | What it costs the timing |
+|--------|--------------------|--------------------------|
+| `laser_enable` | `loop()`, once per run | nothing — outside the timed window |
+| `camera_capturing` | the camera; sampled in `beginCycle()` | nothing — read before the pulse |
+| `laser_signal` | `loop()`, blocking `delayMicroseconds()` | `pulse_us`, before the timed window opens |
+| `laser_confirm` | the laser; latched by an external interrupt | one ISR entry, before `delay_us` starts counting |
+| `shutter_enable` | Timer1/OC1A, in hardware | none — no software between the compare match and the pin |
+
+That last row is the point of the design, but it is worth being precise about
+what it does and does not buy. Each *edge* is placed by the compare match
+itself, so nothing `loop()` happens to be busy with — a serial write, a
+blocking `delayMicroseconds()` — can push it late. What software still sits in
+is the *arming* of each interval: `delay_us` is armed by `laserConfirmISR()`
+and `capture_us` is re-armed by the compare ISR, and both reset `TCNT1`. Each
+interval therefore runs about one interrupt entry longer than its configured
+value — a few microseconds at 16 MHz. Small and near-constant, but not zero;
+if the gate width has to be exact, measure it and trim `CAPTURE` to suit.
+
+### One cycle in time
+
+Not to scale: `delay_us` and `capture_us` are configurable up to a second each,
+while `pulse_us` defaults to 10 µs.
+
+```
+                        START       confirm             open                    close done
+                        v           v                   v                       v     v
+  camera_capturing  ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+  laser_enable      ____/‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾\_____
+  laser_signal      ‾‾‾‾‾‾‾‾\__/‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+  laser_confirm     ________________/‾\_____________________________________________________
+  shutter_enable    ____________________________________/‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾\___________
+                                    |<---- delay_us --->|<------ capture_us --->|
+```
+
+`camera_capturing` is drawn flat because a cycle cannot start without it, but
+it is only *read* once per cycle, just before the `laser_signal` pulse — a
+camera that drops out mid-gate is not noticed until the next cycle begins. Only the rising edge of
+`laser_confirm` matters; how long the laser holds it is ignored. And the gap
+between `laser_signal` rising and `laser_confirm` arriving belongs to the
+laser controller, not to this sketch — it is unbounded except by
+`confirm_timeout`.
+
+For a second cycle, everything from the camera sample to the shutter close
+repeats with `laser_enable` still high; it drops only after the final gate
+closes.
 
 ## Sequence
 
