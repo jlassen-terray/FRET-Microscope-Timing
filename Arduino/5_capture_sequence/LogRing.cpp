@@ -81,7 +81,9 @@ void resetLog()
 
 
 // Lines are prefixed "V " so a host parser can separate them from command
-// responses. The "+" column is the gap since the previous logged event, which
+// responses. Both numbers carry a "us" suffix: they come from micros(), not
+// from Timer1, and unlabelled they read like tick counts. The "+" column is
+// the gap since the previous logged event, which
 // is the number worth watching: it is the measured version of delay_us,
 // capture_us, and the laser's own response time.
 
@@ -120,10 +122,12 @@ void drainLog()
 
     Serial.print(F(" t="));
     Serial.print(entry.timestampUs);
+    Serial.print(F("us"));
 
     if (LogHaveLast) {
       Serial.print(F(" +"));
       Serial.print(entry.timestampUs - LogLastUs);
+      Serial.print(F("us"));
     }
 
     Serial.println();

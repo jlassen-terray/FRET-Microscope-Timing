@@ -510,22 +510,24 @@ did, with measured intervals. Set it before `START` — like every other `SET`,
 it is refused while a sequence is running.
 
 ```
-V 1 CYCLE_BEGIN t=1048576
-V 1 PULSE t=1048588 +12
-V 1 CONFIRM t=1048712 +124
-V 1 SHUTTER_OPEN t=1048912 +200
-V 1 SHUTTER_CLOSE t=1049412 +500
-V 2 CYCLE_BEGIN t=1049640 +228
-V 2 PULSE t=1049652 +12
-V 2 CONFIRM t=1049776 +124
-V 2 SHUTTER_OPEN t=1049976 +200
-V 2 SHUTTER_CLOSE t=1050476 +500
-V 2 DONE t=1050480 +4
+V 1 CYCLE_BEGIN t=1048576us
+V 1 PULSE t=1048588us +12us
+V 1 CONFIRM t=1048712us +124us
+V 1 SHUTTER_OPEN t=1048912us +200us
+V 1 SHUTTER_CLOSE t=1049412us +500us
+V 2 CYCLE_BEGIN t=1049640us +228us
+V 2 PULSE t=1049652us +12us
+V 2 CONFIRM t=1049776us +124us
+V 2 SHUTTER_OPEN t=1049976us +200us
+V 2 SHUTTER_CLOSE t=1050476us +500us
+V 2 DONE t=1050480us +4us
 ```
 
-Format is `V <cycle> <EVENT> t=<micros> +<delta>`. The `V ` prefix keeps these
-lines separable from command responses. The `+` column — the gap since the
-previous event — is the useful one:
+Format is `V <cycle> <EVENT> t=<micros>us +<delta>us`. The `V ` prefix keeps
+these lines separable from command responses. Both numbers are microseconds
+and say so, because unlabelled they read like the Timer1 tick counts `GET`
+and `SET` echo — they are not, they come from `micros()`. The `+` column —
+the gap since the previous event — is the useful one:
 
 | Gap | Measures |
 |-----|----------|
