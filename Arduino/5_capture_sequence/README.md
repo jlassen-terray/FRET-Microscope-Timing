@@ -510,22 +510,24 @@ did, with measured intervals. Set it before `START` — like every other `SET`,
 it is refused while a sequence is running.
 
 ```
-V 1 CYCLE_BEGIN t=1048576
-V 1 PULSE t=1048588 +12
-V 1 CONFIRM t=1048712 +124
-V 1 SHUTTER_OPEN t=1048912 +200
-V 1 SHUTTER_CLOSE t=1049412 +500
-V 2 CYCLE_BEGIN t=1049640 +228
-V 2 PULSE t=1049652 +12
-V 2 CONFIRM t=1049776 +124
-V 2 SHUTTER_OPEN t=1049976 +200
-V 2 SHUTTER_CLOSE t=1050476 +500
-V 2 DONE t=1050480 +4
+V 1 CYCLE_BEGIN t=1048576us
+V 1 PULSE t=1048588us +11.6875us
+V 1 CONFIRM t=1048712us +124.3125us
+V 1 SHUTTER_OPEN t=1048912us +200.0000us
+V 1 SHUTTER_CLOSE t=1049412us +500.0000us
+V 2 CYCLE_BEGIN t=1049640us +228.5625us
+V 2 PULSE t=1049652us +11.6875us
+V 2 CONFIRM t=1049776us +124.1250us
+V 2 SHUTTER_OPEN t=1049976us +200.0000us
+V 2 SHUTTER_CLOSE t=1050476us +500.0000us
+V 2 DONE t=1050480us +3.8125us
 ```
 
-Format is `V <cycle> <EVENT> t=<micros> +<delta>`. The `V ` prefix keeps these
-lines separable from command responses. The `+` column — the gap since the
-previous event — is the useful one:
+Format is `V <cycle> <EVENT> t=<micros>us +<delta>us`. The `V ` prefix keeps
+these lines separable from command responses. Both numbers are microseconds
+and say so, because unlabelled they read like the Timer1 tick counts `GET`
+and `SET` echo — they are not. The `+` column — the gap since the previous
+event — is the useful one:
 
 | Gap | Measures |
 |-----|----------|
@@ -535,24 +537,68 @@ previous event — is the useful one:
 | `SHUTTER_OPEN` → `SHUTTER_CLOSE` | `capture_us` as actually produced |
 | `SHUTTER_CLOSE` → next `CYCLE_BEGIN` | inter-cycle turnaround |
 
+### Where the decimals come from
+
+The gap is resolved to **62.5 ns**, which is why it prints four decimal
+places: one tick is 0.0625 µs, so the fraction is always one of sixteen exact
+values and nothing is rounded.
+
+That precision does not come from `micros()`, which steps in 4 µs — Timer0 is
+prescaled /64 and the low bits do not exist. At that granularity the step is
+most of the measurement: a 10 µs pulse reads 8 or 12, and the 50 µs default
+capture is only ever right to 8%.
+
+It does not come from Timer1 either, despite Timer1 being the finer clock.
+Timer1 is **stopped** for every gap software produces — the pulse, the laser's
+answer, the turnaround — and runs only across `delay_us` and `capture_us`,
+which are `OCR1A + 1` ticks by construction and therefore already known
+exactly. `armTimer1()` also zeroes `TCNT1` and changes the prescaler per
+phase, so it is not a timeline at all.
+
+So the log keeps its own clock: **Timer5, 16 bit, free-running at /1**, with
+no interrupt attached. Each event stores two stamps — `micros()`, coarse but
+never wrapping within a run, and `TCNT5`, exact but wrapping every 4096 µs.
+The drain combines them: the coarse delta only has to be right to within half
+a wrap to say which wrap the fine delta landed in, and it is good to a few µs.
+Gaps longer than a second print as whole microseconds, where sub-µs precision
+would be measuring a laser or a person anyway.
+
+Timer5 is therefore reserved. Its compare outputs stay disconnected so pins
+44–46 remain GPIO; the only cost is `analogWrite()` on those three, which this
+sketch does not use. Timer3 and Timer4 were left alone because their output
+pins collide with `laser_confirm`/`camera_capturing` and `laser_enable`.
+
+**This removes quantisation, not latency.** The stamps are still taken at
+software points, so an interrupt landing inside a gap still widens it, and
+`CYCLE_BEGIN` → `PULSE` still reads a little wide because it brackets the ring
+push and the `micros()` call as well as the pulse. What changed is that the
+number is now precise enough for that overhead to be visible instead of buried
+in a 4 µs step.
+
 ### Does it affect the timing?
 
 **Not the hardware windows.** `delay_us` and `capture_us` are produced by the
 Timer1 compare output. Events are captured into a 32-entry ring buffer —
-a `micros()` read and a few stores — and every `logEvent()` call is placed
-*after* the timer registers have been written, so no edge ever waits on it.
-Formatting and the serial write happen later, in `loop()`. The pulse itself is
-bracketed so no log call can land between its two edges and widen it.
+a `micros()` read, a `TCNT5` read, and a few stores — and every `logEvent()`
+call is placed *after* the timer registers have been written, so no edge ever
+waits on it. Formatting and the serial write happen later, in `loop()`. The
+pulse itself is bracketed so no log call can land between its two edges and
+widen it.
+
+The log clock adds no interrupt of its own, which is deliberate: Timer5 is
+only ever read. An overflow interrupt at 62.5 ns resolution would fire every
+4 ms and put latency jitter back into `laserConfirmISR`, which is the one
+thing the hardware-edge design exists to keep out.
 
 **Yes, the inter-cycle gap.** Draining the log is a blocking serial write, and
-the next cycle is armed from `loop()`. A verbose cycle is roughly 200
+the next cycle is armed from `loop()`. A verbose cycle is roughly 240
 characters:
 
 | Baud | Per cycle |
 |------|-----------|
-| 9600 | ~208 ms |
-| 38400 | ~52 ms |
-| 115200 | ~17 ms |
+| 9600 | ~250 ms |
+| 38400 | ~63 ms |
+| 115200 | ~21 ms |
 
 At 9600 that gap dominates. Raise `SERIAL_BAUD` in `Config.h` to 115200 for
 logging a fast sequence. Draining is deliberately the *last* thing
@@ -632,7 +678,7 @@ behind how it does it.
 | `Config.h/.cpp` | Pins, polarity, limits, firmware identity | — |
 | `Timer1.h/.cpp` | Durations, arming, the shutter output | Config |
 | `Settings.h/.cpp` | The six values `SET`/`GET` operate on | Timer1 |
-| `LogRing.h/.cpp` | The verbose event ring and its drain | Settings |
+| `LogRing.h/.cpp` | The verbose event ring, its drain, and the Timer5 log clock | Config, Settings |
 | `Sequence.h/.cpp` | The state machine and both ISRs | all of the above |
 | `Commands.h/.cpp` | The serial protocol, `HELP`, the banner | all of the above |
 

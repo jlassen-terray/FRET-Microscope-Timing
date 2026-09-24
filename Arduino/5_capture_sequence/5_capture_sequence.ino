@@ -31,7 +31,7 @@
 //     Config      pins, polarity, limits, firmware identity
 //     Timer1      durations, arming, the shutter output
 //     Settings    the six values SET and GET operate on
-//     LogRing     the verbose event ring and its drain
+//     LogRing     the verbose event ring, its drain, and the log clock
 //     Sequence    the state machine and the two ISRs
 //     Commands    the serial protocol, HELP, and the banner
 //
@@ -41,6 +41,7 @@
 
 #include "Commands.h"
 #include "Config.h"
+#include "LogRing.h"
 #include "Sequence.h"
 #include "Settings.h"
 #include "Timer1.h"
@@ -82,6 +83,11 @@ void setup()
 
   // Enable the Compare A interrupt. Without this the sequence cannot advance.
   TIMSK1 = (1 << OCIE1A);
+
+  // Timer5, free-running, read by the verbose log only. Started regardless of
+  // VERBOSE: it costs nothing to leave counting and nothing has to change
+  // when VERBOSE is turned on mid-session.
+  beginLog();
 
   // Durations are stored as resolved register values, so the defaults have to
   // go through resolveDuration() rather than being written out in Settings.

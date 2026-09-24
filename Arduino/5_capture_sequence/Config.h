@@ -107,8 +107,8 @@ const unsigned long MAX_CONFIRM_TIMEOUT_MS = 600000UL;
 //     9600 baud ->    960 byte/s -> 1.04 ms per byte
 //   115200 baud -> 11520 byte/s -> 0.09 ms per byte
 //
-// A verbose cycle emits roughly 200 characters. At 9600 baud that is about
-// 208 ms of transmission, which lands entirely in the gap between cycles.
+// A verbose cycle emits roughly 240 characters. At 9600 baud that is about
+// 250 ms of transmission, which lands entirely in the gap between cycles.
 // Raise this to 115200 when logging a fast sequence.
 // ----------------------------------------------------------------------------
 
