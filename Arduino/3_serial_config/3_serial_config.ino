@@ -155,13 +155,24 @@ volatile bool PendingDone = false;
 // SHUTTER RESET
 //
 // OC1A is driven in hardware toggle mode, so the shutter state depends on how
-// many compare matches have occurred. Force it back to a known closed state by
-// briefly disconnecting the compare output.
+// many compare matches have occurred. An odd number leaves it open, so there
+// has to be a way to force it back to closed.
+//
+// Writing the port will not do it. While a COM1A bit is set the waveform
+// generator owns the pin, and the value it drives lives in the OC1A register,
+// which keeps its state across a TCCR1A write. Disconnecting the output,
+// writing the port low and reconnecting only holds the pin low for the few
+// cycles it is disconnected: the moment toggle mode comes back, the stale OC1A
+// register reappears on the pin and the shutter is open again.
+//
+// The supported way to set OC1A directly is a forced compare. Select
+// "clear on compare match" and strobe FOC1A: the compare output logic applies
+// the COM1A setting to the OC1A register without raising OCF1A and without
+// resetting the counter. Then restore toggle mode for the next exposure.
 // ----------------------------------------------------------------------------
 void resetShutter() {
-  TCCR1A = 0;
-
-  digitalWrite(SHUTTER_PIN, LOW);
+  TCCR1A = (1 << COM1A1);
+  TCCR1C = (1 << FOC1A);
 
   TCCR1A = (1 << COM1A0);
 }
@@ -308,7 +319,18 @@ ISR(TIMER1_COMPA_vect) {
 
       break;
 
+    // ------------------------------------------------------------------------
+    // A MATCH NOBODY ASKED FOR
+    //
+    // The timer is running with no transition expected, so it is free-running
+    // in CTC and will keep toggling the shutter every OCR1A. Shut it down and
+    // close the shutter rather than leaving the pin flapping.
+    // ------------------------------------------------------------------------
     default:
+      stopTimer1();
+
+      resetShutter();
+
       break;
   }
 }
@@ -362,8 +384,17 @@ void startSequence() {
 
 // ----------------------------------------------------------------------------
 // ABORT; Returns all outputs to a safe state
+//
+// Runs with interrupts off. laserReturnISR re-arms Timer1 whenever it finds
+// State still set to WAITING_FOR_LASER_RETURN, so tearing down with interrupts
+// on leaves a window between stopTimer1() and State = IDLE where a late return
+// edge starts the timer back up behind us. Nothing stops it after that: the
+// delay expires, the hardware toggles the shutter open, and the compare ISR
+// finds no pending event and does nothing.
 // ----------------------------------------------------------------------------
 void abortSequence() {
+  noInterrupts();
+
   stopTimer1();
 
   Timer1Event = TIMER_NONE;
@@ -373,6 +404,8 @@ void abortSequence() {
   CurrentCycle = 0;
 
   resetShutter();
+
+  interrupts();
 
   // TODO: Turn laser off
 }
