@@ -25,6 +25,8 @@ technique and [sketch 3](../3_serial_config) for the serial command interface.
 | `laser_signal` | 9 | out | HIGH |
 | `shutter_enable` | 11 (OC1A) | out | LOW |
 
+The [signal map](#signal-map) below shows how these five orchestrate a cycle.
+
 `shutter_enable` must stay on pin 11 — it is the Timer1 Compare A output, and
 that is what produces the gate edges in hardware.
 
@@ -109,6 +111,116 @@ flowchart LR
 Note the optoisolated form inverts the signal and needs a pull-up, so it is the
 `INPUT_PULLUP` / `FALLING` configuration described under Signals.
 
+## Signal map
+
+A cycle is a closed loop that leaves the board on `laser_signal`, comes back
+on `laser_confirm`, and only then lets Timer1 place the shutter gate. The two
+inputs play different roles: `laser_confirm` is an **edge** that advances the
+sequence, `camera_capturing` is a **level** that gates it. Of the outputs,
+`laser_enable` is held for the whole run, `laser_signal` is a short pulse per
+cycle, and `shutter_enable` is the one deliverable the whole thing exists to
+place.
+
+Solid arrows are edges that drive the sequence forward; dotted arrows are
+levels sampled and timeouts — conditions rather than events. The two
+thick-bordered nodes are transitions the hardware produces with no software in
+the path.
+
+```mermaid
+flowchart TB
+    HOST(["Host serial"])
+    CAMERA(["Camera"])
+    LASER(["Laser controller"])
+    SHUTTER(["Shutter / gate driver"])
+
+    subgraph MEGA["Arduino Mega 2560"]
+        direction TB
+
+        EN["laser_enable HIGH<br/>pin 8, held for the whole run"]
+        GATE{"camera_capturing<br/>HIGH?"}
+        PULSE["laser_signal HIGH → LOW → HIGH<br/>pin 9, loop() blocks pulse_us"]
+        ARM["arm Timer1 with delay_us<br/>laserConfirmISR()"]
+        OPEN["OC1A toggles HIGH<br/>shutter_enable opens"]
+        REARM["arm Timer1 with capture_us<br/>TIMER1_COMPA ISR"]
+        CLOSE["OC1A toggles LOW<br/>shutter_enable closes"]
+        MORE{"cycles<br/>remain?"}
+        OFF["laser_enable LOW<br/>pin 8"]
+        ERRC["ERROR CAMERA<br/>NOT CAPTURING"]
+        ERRL["ERROR LASER<br/>CONFIRM TIMEOUT"]
+    end
+
+    HOST -->|"START"| EN
+    EN --> GATE
+    CAMERA -.->|"pin 3, sampled once per cycle"| GATE
+    GATE -->|"no"| ERRC
+    GATE -->|"yes"| PULSE
+    PULSE -->|"pin 9, 5V TTL"| LASER
+    LASER -->|"pin 2, rising edge"| ARM
+    LASER -.->|"silent past confirm_timeout"| ERRL
+    ARM -->|"delay_us elapses"| OPEN
+    OPEN -->|"pin 11, 5V TTL"| SHUTTER
+    OPEN --> REARM
+    REARM -->|"capture_us elapses"| CLOSE
+    CLOSE -->|"pin 11, 5V TTL"| SHUTTER
+    CLOSE --> MORE
+    MORE -->|"yes"| GATE
+    MORE -->|"no"| OFF
+    OFF -->|"DONE"| HOST
+    ERRC --> HOST
+    ERRL --> HOST
+
+    classDef hw stroke-width:3px
+    class OPEN,CLOSE hw
+```
+
+Reading the loop as responsibilities rather than as a path:
+
+| Signal | Who drives the edge | What it costs the timing |
+|--------|--------------------|--------------------------|
+| `laser_enable` | `loop()`, once per run | nothing — outside the timed window |
+| `camera_capturing` | the camera; sampled in `beginCycle()` | nothing — read before the pulse |
+| `laser_signal` | `loop()`, blocking `delayMicroseconds()` | `pulse_us`, before the timed window opens |
+| `laser_confirm` | the laser; latched by an external interrupt | one ISR entry, before `delay_us` starts counting |
+| `shutter_enable` | Timer1/OC1A, in hardware | none — no software between the compare match and the pin |
+
+That last row is the point of the design, but it is worth being precise about
+what it does and does not buy. Each *edge* is placed by the compare match
+itself, so nothing `loop()` happens to be busy with — a serial write, a
+blocking `delayMicroseconds()` — can push it late. What software still sits in
+is the *arming* of each interval: `delay_us` is armed by `laserConfirmISR()`
+and `capture_us` is re-armed by the compare ISR, and both reset `TCNT1`. Each
+interval therefore runs about one interrupt entry longer than its configured
+value — a few microseconds at 16 MHz. Small and near-constant, but not zero;
+if the gate width has to be exact, measure it and trim `CAPTURE` to suit.
+
+### One cycle in time
+
+Not to scale: `delay_us` and `capture_us` are configurable up to a second each,
+while `pulse_us` defaults to 10 µs.
+
+```
+                        START       confirm             open                    close done
+                        v           v                   v                       v     v
+  camera_capturing  ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+  laser_enable      ____/‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾\_____
+  laser_signal      ‾‾‾‾‾‾‾‾\__/‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+  laser_confirm     ________________/‾\_____________________________________________________
+  shutter_enable    ____________________________________/‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾\___________
+                                    |<---- delay_us --->|<------ capture_us --->|
+```
+
+`camera_capturing` is drawn flat because a cycle cannot start without it, but
+it is only *read* once per cycle, just before the `laser_signal` pulse — a
+camera that drops out mid-gate is not noticed until the next cycle begins. Only the rising edge of
+`laser_confirm` matters; how long the laser holds it is ignored. And the gap
+between `laser_signal` rising and `laser_confirm` arriving belongs to the
+laser controller, not to this sketch — it is unbounded except by
+`confirm_timeout`.
+
+For a second cycle, everything from the camera sample to the shutter close
+repeats with `laser_enable` still high; it drops only after the final gate
+closes.
+
 ## Sequence
 
 ```mermaid
@@ -175,9 +287,13 @@ closing and the next cycle arming. And a `confirm_timeout` of `0` removes the
 
 ## Commands
 
-9600 baud, newline-terminated, case-insensitive. The sketch prints `READY`
-once on boot. Baud is `SERIAL_BAUD` at the top of the sketch — raise it to
-115200 if you intend to use verbose logging.
+9600 baud, newline-terminated, case-insensitive. On boot the sketch prints the
+banner described under [Boot banner](#boot-banner) and then `READY`. `READY` is
+still the last line of boot output, so a host that waits for it needs no
+changes.
+
+Baud is `SERIAL_BAUD` at the top of the sketch — raise it to 115200 if you
+intend to use verbose logging.
 
 | Command | Range | Default | Meaning |
 |---------|-------|---------|---------|
@@ -190,9 +306,117 @@ once on boot. Baud is `SERIAL_BAUD` at the top of the sketch — raise it to
 | `START` | — | — | Runs the sequence |
 | `ABORT` (or `STOP`) | — | — | Drops laser_enable, releases the shutter |
 | `STATUS` | — | — | State, cycle progress, live camera level |
+| `INFO` | — | — | Reprints the boot banner |
+| `HELP` (or `?`) | — | — | Lists every command |
 
 `SET PULSE` is the runtime control for `LaserSignalPulseUs`;
 `SET CONFIRM_TIMEOUT` for `ConfirmTimeoutMs`.
+
+### HELP
+
+`HELP` (or `?`) prints the table above from the firmware itself, with the
+limits built from the same constants the parser enforces, so it cannot drift
+out of step with the build actually on the board:
+
+```
+> HELP
+OK HELP
+  START                     run CYCLE_COUNT cycles
+  ABORT | STOP              stop, drop laser_enable, free shutter
+  STATUS                    state, cycle progress, camera level
+  INFO                      reprint the boot banner
+  HELP | ?                  this list
+
+  SET DELAY <us>            1-1000000us   laser_confirm to shutter open
+  SET CAPTURE <us>          1-1000000us   shutter gate width
+  SET CYCLE_COUNT <n>       1-65535       cycles per START
+  SET PULSE <us>            1-16383us     laser_signal low-pulse width
+  SET CONFIRM_TIMEOUT <ms>  0-600000ms    confirm wait, 0 disables
+  SET VERBOSE <0|1>         0-1           measured event log
+
+  GET reads back any of the six settings, e.g. GET DELAY.
+  SET, HELP and INFO are rejected with ERROR BUSY while running.
+OK HELP END
+```
+
+Every body line is indented by two spaces and the block is bracketed by
+`OK HELP` and `OK HELP END`, so a host reading line by line can swallow
+everything between the two markers without parsing the entries. The boot
+banner below is the only other multi-line response and follows the same shape.
+
+`HELP` is rejected with `ERROR BUSY` while a sequence is running, for a
+different reason than `SET` is. The block is roughly 700 bytes — about 700 ms
+at 9600 baud once the 64-byte transmit buffer backs up — and `loop()` is what
+starts each next cycle, so printing it mid-run would stretch the gap between
+cycles. The text is stored in flash with `F()`; in RAM it would cost a tenth of
+the Mega's SRAM.
+
+### Boot banner
+
+`setup()` prints a banner before `READY`, and `INFO` reprints it on demand.
+It answers the three questions asked at the start of every bring-up session:
+what is running on this board, how is it wired, and what is it set to.
+
+```
+INFO
+  FRET Capture Sequence Controller
+  version 1.0.0   built Sep 23 2026 18:42:11
+  Arduino Mega 2560   serial 9600 8N1
+
+  Pins
+    laser_enable      8    output, held HIGH for the run
+    laser_signal      9    output, idles HIGH, pulses LOW
+    laser_confirm     2    input, interrupt on RISING
+    camera_capturing  3    input, active HIGH
+    shutter_enable    11   output, OC1A, driven by Timer1
+
+  Settings
+    DELAY             1us -> 1us (16 ticks @ /1)
+    CAPTURE           50us -> 50us (800 ticks @ /1)
+    CYCLE_COUNT       1
+    PULSE             10us
+    CONFIRM_TIMEOUT   5000ms
+    VERBOSE           0
+
+  Inputs now
+    camera_capturing  IDLE
+    laser_confirm     LOW
+
+  HELP lists the commands, STATUS reports live state.
+INFO END
+READY
+```
+
+Four things in there earn their place:
+
+- **`built`** is stamped by the compiler from `__DATE__` and `__TIME__`, so the
+  banner settles "is the board actually running my latest upload?" without a
+  round trip. One caveat: a cached build is not recompiled, so an unchanged
+  sketch keeps its earlier stamp. Touch the file or clean the build if the
+  timestamp has to be trustworthy.
+- **Pins** are printed from the same constants the sketch wires up, so the
+  banner cannot describe a pinout the firmware is not using.
+- **Settings** are the live values, not the defaults. After `INFO` that means
+  whatever you have `SET` so far this session.
+- **Inputs now** is read with `digitalRead` as the banner prints. A camera line
+  that is dark or miswired shows up here at boot, rather than as an
+  `ERROR CAMERA NOT CAPTURING` on your first `START`.
+
+The block is bracketed by `INFO` and `INFO END` on the same principle as
+`HELP`. Note that the banner is deliberately **not** the boot marker — `READY`
+is. That keeps the `INFO` markers honest when the block is reprinted
+mid-session, and it means an unexpected `READY` still tells a host the board
+reset under it.
+
+`INFO` is rejected with `ERROR BUSY` while a sequence is running, for the same
+reason `HELP` is: at 9600 baud the block takes roughly a second to clock out,
+and `loop()` is what starts each next cycle.
+
+Identity lives in `FIRMWARE_NAME` and `FIRMWARE_VERSION` at the top of the
+sketch. Both are `PROGMEM`, as is every fixed string in the banner, so the
+whole thing costs about 2.1 kB of flash and no meaningful SRAM. Bump
+`FIRMWARE_VERSION` when the protocol changes, since that is what a host would
+gate its behaviour on.
 
 ### Responses
 
@@ -244,13 +468,14 @@ consistent behaviour.
 | Error | Cause |
 |-------|-------|
 | `ERROR UNKNOWN COMMAND` | Unrecognised input |
-| `ERROR BUSY` | `START` or any `SET` while a sequence is running |
+| `ERROR BUSY` | `START`, `HELP`, `INFO`, or any `SET` while a sequence is running |
 | `ERROR CAMERA NOT CAPTURING` | `camera_capturing` low at the start of any cycle; sequence aborts |
 | `ERROR LASER CONFIRM TIMEOUT` | No `laser_confirm` within `confirm_timeout`; sequence aborts |
 | `ERROR <FIELD> VALUE` | Argument is not a plain non-negative integer |
 | `ERROR <FIELD> RANGE <lo>-<hi>` | Argument parsed but out of range |
 
-`<FIELD>` is `DELAY`, `CAPTURE`, `CYCLE_COUNT`, `PULSE`, or `CONFIRM_TIMEOUT`.
+`<FIELD>` is `DELAY`, `CAPTURE`, `CYCLE_COUNT`, `PULSE`, `CONFIRM_TIMEOUT`, or
+`VERBOSE`.
 The `RANGE` message appends `us` for `DELAY` and `CAPTURE`
 (`ERROR DELAY RANGE 1-1000000us`) and is unitless for the rest
 (`ERROR PULSE RANGE 1-16383`).
@@ -333,6 +558,13 @@ These were added and are all easy to strip:
   long, so the width is a guess made adjustable rather than a buried constant.
 - `STATUS` — bring-up is easier with a state read.
 - `VERBOSE` — measured event log; see above for its timing cost.
+- `HELP`/`?` — the command set has grown past what is worth remembering at a
+  serial monitor, and quoting the limits from the constants means the board
+  documents itself.
+- The boot banner and `INFO` — the spec's `READY` says the board is alive but
+  not which build, which pinout, or what it is set to. `INFO` exists because a
+  host that opens the port after boot has already missed the banner, which is
+  the common case rather than the exception.
 - The prescaler selection, which extends `delay_us` and `capture_us` past the
   4096 µs a fixed unprescaled Timer1 would cap them at.
 

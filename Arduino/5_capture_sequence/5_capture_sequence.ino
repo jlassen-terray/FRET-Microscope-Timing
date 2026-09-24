@@ -23,6 +23,29 @@
 
 
 // ----------------------------------------------------------------------------
+// IDENTITY
+//
+// Printed in the boot banner. FIRMWARE_VERSION is the thing to bump when the
+// protocol changes, since that is what a host would gate its behaviour on.
+//
+// __DATE__ and __TIME__ are stamped by the compiler, which makes the banner
+// the quickest way to confirm the board is running the build you think it is.
+// One caveat: a cached build is not recompiled, so an unchanged sketch keeps
+// its earlier stamp. Touch the file or clean the build if that matters.
+// ----------------------------------------------------------------------------
+
+// PROGMEM keeps these out of SRAM. FLASH_STR is the cast that lets Serial and
+// String read them back from flash rather than copying them down first.
+const char FIRMWARE_NAME[] PROGMEM = "FRET Capture Sequence Controller";
+const char FIRMWARE_VERSION[] PROGMEM = "1.0.0";
+
+#define FLASH_STR(s) ((const __FlashStringHelper *)(s))
+
+// SERIAL_BAUD is defined with the rest of the serial notes further down, and
+// the banner prints it.
+
+
+// ----------------------------------------------------------------------------
 // PINS
 // ----------------------------------------------------------------------------
 
@@ -221,10 +244,17 @@ Duration CaptureTime;
 uint16_t CycleCount = 1;
 
 
+// Just the value, no "OK <LABEL>" prefix, so the boot banner can print the
+// same text in a column without having to strip anything off the front.
+String durationDetail(const Duration &d)
+{
+  return String(d.requestedUs) + "us -> " + d.actualUs + "us (" +
+         ((unsigned long)d.compare + 1) + " ticks @ /" + d.prescaler + ")";
+}
+
 String describeDuration(const char *label, const Duration &d)
 {
-  return String("OK ") + label + " " + d.requestedUs + "us -> " + d.actualUs +
-         "us (" + ((unsigned long)d.compare + 1) + " ticks @ /" + d.prescaler + ")";
+  return String("OK ") + label + " " + durationDetail(d);
 }
 
 String getDelayResponseString()
@@ -583,6 +613,10 @@ void setup()
       LASER_CONFIRM_EDGE
   );
 
+  // Banner first, then READY. READY stays the last line of boot output, which
+  // is what a host waits for.
+  printBanner();
+
   Serial.println("READY");
 }
 
@@ -842,6 +876,215 @@ const String SET_VERBOSE_COMMAND = "SET VERBOSE";
 
 
 // ----------------------------------------------------------------------------
+// HELP
+//
+// Lists every command the parser accepts.
+//
+// Body lines are indented and the block is bracketed by OK HELP and
+// OK HELP END, so a host reading line by line can swallow the whole thing
+// without having to recognise each entry.
+//
+// The limits are built from the constants rather than written into the text,
+// so they cannot drift out of step with what the parser actually enforces.
+//
+// The text lives in flash via F(). It is about 700 bytes, which would be a
+// tenth of the Mega's SRAM if it sat in RAM with the String work below.
+// ----------------------------------------------------------------------------
+
+const uint8_t HELP_TEXT_COLUMN = 28;
+const uint8_t HELP_DESCRIPTION_COLUMN = 42;
+
+void padTo(String &line, uint8_t column)
+{
+  while (line.length() < column) {
+    line += ' ';
+  }
+}
+
+void printHelpLine(const __FlashStringHelper *usage,
+                   const __FlashStringHelper *text)
+{
+  String line = String("  ") + usage;
+
+  padTo(line, HELP_TEXT_COLUMN);
+
+  Serial.println(line + text);
+}
+
+void printHelpField(const __FlashStringHelper *usage,
+                    const String &limits,
+                    const __FlashStringHelper *description)
+{
+  String line = String("  ") + usage;
+
+  padTo(line, HELP_TEXT_COLUMN);
+
+  line += limits;
+
+  padTo(line, HELP_DESCRIPTION_COLUMN);
+
+  Serial.println(line + description);
+}
+
+void printHelp()
+{
+  Serial.println(F("OK HELP"));
+
+  printHelpLine(F("START"), F("run CYCLE_COUNT cycles"));
+  printHelpLine(F("ABORT | STOP"), F("stop, drop laser_enable, free shutter"));
+  printHelpLine(F("STATUS"), F("state, cycle progress, camera level"));
+  printHelpLine(F("INFO"), F("reprint the boot banner"));
+  printHelpLine(F("HELP | ?"), F("this list"));
+
+  Serial.println();
+
+  printHelpField(F("SET DELAY <us>"),
+                 String(MIN_US) + "-" + MAX_US + "us",
+                 F("laser_confirm to shutter open"));
+
+  printHelpField(F("SET CAPTURE <us>"),
+                 String(MIN_US) + "-" + MAX_US + "us",
+                 F("shutter gate width"));
+
+  printHelpField(F("SET CYCLE_COUNT <n>"),
+                 String(MIN_CYCLE_COUNT) + "-" + MAX_CYCLE_COUNT,
+                 F("cycles per START"));
+
+  printHelpField(F("SET PULSE <us>"),
+                 String(MIN_PULSE_US) + "-" + MAX_PULSE_US + "us",
+                 F("laser_signal low-pulse width"));
+
+  printHelpField(F("SET CONFIRM_TIMEOUT <ms>"),
+                 String(MIN_CONFIRM_TIMEOUT_MS) + "-" + MAX_CONFIRM_TIMEOUT_MS + "ms",
+                 F("confirm wait, 0 disables"));
+
+  printHelpField(F("SET VERBOSE <0|1>"),
+                 String("0-1"),
+                 F("measured event log"));
+
+  Serial.println();
+
+  Serial.println(F("  GET reads back any of the six settings, e.g. GET DELAY."));
+  Serial.println(F("  SET, HELP and INFO are rejected with ERROR BUSY while running."));
+
+  Serial.println(F("OK HELP END"));
+}
+
+
+// ----------------------------------------------------------------------------
+// BOOT BANNER
+//
+// Printed once from setup(), and again on demand via INFO. Answers the three
+// questions asked at the start of every bring-up session: what is running on
+// this board, how is it wired, and what is it currently set to.
+//
+// Bracketed by INFO and INFO END on the same principle as the HELP block, so
+// a host reading line by line can swallow the whole thing without recognising
+// each row. READY still follows on boot and is still the last line printed,
+// so an existing host that waits for READY is unaffected by any of this.
+//
+// The banner is deliberately not the boot marker. READY is. That keeps INFO
+// honest when it reprints the same block mid-session, and it means a stray
+// READY still tells a host the board reset under it.
+//
+// Text is held in flash with F(). The values are what force the String work,
+// and they are transient.
+// ----------------------------------------------------------------------------
+
+const uint8_t BANNER_VALUE_COLUMN = 22;
+const uint8_t BANNER_NOTE_COLUMN = 27;
+
+void printBannerRow(const __FlashStringHelper *name, const String &value)
+{
+  String line = String("    ") + name;
+
+  padTo(line, BANNER_VALUE_COLUMN);
+
+  Serial.println(line + value);
+}
+
+void printBannerPin(const __FlashStringHelper *name,
+                    uint8_t pin,
+                    const __FlashStringHelper *note)
+{
+  String line = String("    ") + name;
+
+  padTo(line, BANNER_VALUE_COLUMN);
+
+  line += pin;
+
+  padTo(line, BANNER_NOTE_COLUMN);
+
+  Serial.println(line + note);
+}
+
+void printBanner()
+{
+  Serial.println(F("INFO"));
+
+  Serial.println(String("  ") + FLASH_STR(FIRMWARE_NAME));
+
+  Serial.println(String("  version ") + FLASH_STR(FIRMWARE_VERSION) +
+                 "   built " + F(__DATE__) + " " + F(__TIME__));
+
+  Serial.println(String("  Arduino Mega 2560   serial ") + SERIAL_BAUD + " 8N1");
+
+  Serial.println();
+
+  Serial.println(F("  Pins"));
+
+  printBannerPin(F("laser_enable"), LASER_ENABLE_PIN,
+                 F("output, held HIGH for the run"));
+
+  printBannerPin(F("laser_signal"), LASER_SIGNAL_PIN,
+                 F("output, idles HIGH, pulses LOW"));
+
+  printBannerPin(F("laser_confirm"), LASER_CONFIRM_PIN,
+                 F("input, interrupt on RISING"));
+
+  printBannerPin(F("camera_capturing"), CAMERA_CAPTURING_PIN,
+                 F("input, active HIGH"));
+
+  printBannerPin(F("shutter_enable"), SHUTTER_ENABLE_PIN,
+                 F("output, OC1A, driven by Timer1"));
+
+  Serial.println();
+
+  Serial.println(F("  Settings"));
+
+  printBannerRow(F("DELAY"), durationDetail(DelayTime));
+  printBannerRow(F("CAPTURE"), durationDetail(CaptureTime));
+  printBannerRow(F("CYCLE_COUNT"), String(CycleCount));
+  printBannerRow(F("PULSE"), String(LaserSignalPulseUs) + "us");
+
+  printBannerRow(F("CONFIRM_TIMEOUT"),
+                 ConfirmTimeoutMs == 0 ? String("0 (disabled)")
+                                       : String(ConfirmTimeoutMs) + "ms");
+
+  printBannerRow(F("VERBOSE"), VerboseEnabled ? F("1 (event log on)") : F("0"));
+
+  Serial.println();
+
+  // Read live rather than assumed. A miswired or idle camera shows up here at
+  // boot instead of as an ERROR CAMERA NOT CAPTURING on the first START.
+  Serial.println(F("  Inputs now"));
+
+  printBannerRow(F("camera_capturing"),
+                 digitalRead(CAMERA_CAPTURING_PIN) == CAMERA_ACTIVE_LEVEL
+                     ? F("CAPTURING") : F("IDLE"));
+
+  printBannerRow(F("laser_confirm"),
+                 digitalRead(LASER_CONFIRM_PIN) == HIGH ? F("HIGH") : F("LOW"));
+
+  Serial.println();
+
+  Serial.println(F("  HELP lists the commands, STATUS reports live state."));
+
+  Serial.println(F("INFO END"));
+}
+
+
+// ----------------------------------------------------------------------------
 // HANDLE A "SET <duration>" COMMAND
 // ----------------------------------------------------------------------------
 
@@ -949,6 +1192,48 @@ void processCommand(String command)
     Serial.print(" CAMERA ");
     Serial.println(
         digitalRead(CAMERA_CAPTURING_PIN) == CAMERA_ACTIVE_LEVEL ? "CAPTURING" : "IDLE");
+
+    return;
+  }
+
+  // --------------------------------------------------------------------------
+  // HELP
+  //
+  // Rejected while running for a different reason than SET is. The block is
+  // around 700 bytes, which is about 700 ms at 9600 baud once the 64 byte
+  // transmit buffer backs up, and loop() is what starts each next cycle.
+  // Blocking it for that long would stretch the gap between cycles.
+  // --------------------------------------------------------------------------
+  if (command == "HELP" || command == "?") {
+    if (isRunning()) {
+      Serial.println("ERROR BUSY");
+
+      return;
+    }
+
+    printHelp();
+
+    return;
+  }
+
+  // --------------------------------------------------------------------------
+  // INFO
+  //
+  // Reprints the boot banner. A host that opened the port after boot missed
+  // it, which is the common case, so it needs to be askable for.
+  //
+  // Held to the same BUSY rule as HELP, and for the same reason: the block is
+  // long enough at 9600 baud that printing it would stretch the gap between
+  // cycles.
+  // --------------------------------------------------------------------------
+  if (command == "INFO") {
+    if (isRunning()) {
+      Serial.println("ERROR BUSY");
+
+      return;
+    }
+
+    printBanner();
 
     return;
   }
