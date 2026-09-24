@@ -78,9 +78,10 @@ the basis for the `us -> ticks` conversion in sketch 3.
 
 ## Design notes
 
-**No `Serial` inside an ISR.** A single line at 9600 baud blocks for roughly a
-millisecond — orders of magnitude longer than the exposures being timed. The
-ISRs raise flags and `loop()` does the printing.
+**No `Serial` inside an ISR.** At 9600 baud, 8N1, a byte costs 1.04 ms on the
+wire — so a 40-character line is roughly 40 ms, four orders of magnitude longer
+than the exposures being timed. The ISRs raise flags and `loop()` does the
+printing.
 
 **Shutter transitions are hardware.** OC1A is left in Timer1 toggle mode, so
 the delay and exposure edges are produced by the timer peripheral itself. No

@@ -41,7 +41,8 @@ const char FIRMWARE_VERSION[] PROGMEM = "1.0.0";
 
 #define FLASH_STR(s) ((const __FlashStringHelper *)(s))
 
-const unsigned long SERIAL_BAUD = 9600;
+// SERIAL_BAUD is defined with the rest of the serial notes further down, and
+// the banner prints it.
 
 
 // ----------------------------------------------------------------------------
@@ -109,6 +110,33 @@ const unsigned long MIN_CONFIRM_TIMEOUT_MS = 0;
 const unsigned long MAX_CONFIRM_TIMEOUT_MS = 600000UL;
 
 unsigned long ConfirmTimeoutMs = 5000;
+
+
+// ----------------------------------------------------------------------------
+// SERIAL
+//
+// 8N1, so one byte costs 10 bits on the wire:
+//
+//     9600 baud ->    960 byte/s -> 1.04 ms per byte
+//   115200 baud -> 11520 byte/s -> 0.09 ms per byte
+//
+// A verbose cycle emits roughly 200 characters. At 9600 baud that is about
+// 208 ms of transmission, which lands entirely in the gap between cycles.
+// Raise this to 115200 when logging a fast sequence.
+// ----------------------------------------------------------------------------
+
+const unsigned long SERIAL_BAUD = 9600;
+
+
+// ----------------------------------------------------------------------------
+// VERBOSE LOGGING
+//
+// Set with SET VERBOSE 1. Events are timestamped the instant they happen and
+// queued; the formatting and the actual serial write both happen later, in
+// loop(). See the LOG RING section for why that matters.
+// ----------------------------------------------------------------------------
+
+bool VerboseEnabled = false;
 
 
 // ----------------------------------------------------------------------------
@@ -249,6 +277,11 @@ String getPulseResponseString()
   return String("OK PULSE ") + LaserSignalPulseUs + "us";
 }
 
+String getVerboseResponseString()
+{
+  return String("OK VERBOSE ") + (VerboseEnabled ? 1 : 0);
+}
+
 String getConfirmTimeoutResponseString()
 {
   if (ConfirmTimeoutMs == 0) {
@@ -292,9 +325,10 @@ volatile unsigned long ConfirmWaitStartedMs = 0;
 // ----------------------------------------------------------------------------
 // DEFERRED OUTPUT AND WORK
 //
-// Nothing prints from an ISR: one line at 9600 baud blocks for about a
-// millisecond, far longer than the windows being timed. The ISR raises a flag
-// and loop() does the work.
+// Nothing prints from an ISR. At 9600 baud a byte costs 1.04 ms on the wire,
+// so a 40-character line is roughly 40 ms -- four orders of magnitude longer
+// than the windows being timed. The ISR raises a flag and loop() does the
+// work.
 //
 // PendingNextCycle matters for a second reason: starting a cycle reads the
 // camera input, pulses laser_signal with a blocking delay, and may need to
@@ -305,6 +339,194 @@ volatile bool PendingCycleStarted = false;
 volatile uint16_t PendingCycleNumber = 0;
 volatile bool PendingDone = false;
 volatile bool PendingNextCycle = false;
+
+
+// ----------------------------------------------------------------------------
+// LOG RING
+//
+// Verbose logging must not perturb what it is measuring, so it is split in
+// two. Producers capture an event id and a micros() stamp into this ring --
+// a handful of instructions, always placed AFTER the timer registers have
+// been written, so no hardware edge ever waits on it. loop() then drains the
+// ring and does the expensive part: formatting and the serial write.
+//
+// Producers run in both interrupt and main context, so pushes save and
+// restore SREG rather than using noInterrupts()/interrupts(). Calling
+// interrupts() inside an ISR would re-enable them early and allow reentry.
+//
+// If the ring fills, events are counted and discarded rather than blocking.
+// A dropped count is reported so the log can never quietly lie about what
+// happened.
+// ----------------------------------------------------------------------------
+
+enum LogEventId : uint8_t
+{
+  LOG_CYCLE_BEGIN,
+  LOG_PULSE,
+  LOG_CONFIRM,
+  LOG_SHUTTER_OPEN,
+  LOG_SHUTTER_CLOSE,
+  LOG_DONE
+};
+
+struct LogEntry
+{
+  unsigned long timestampUs;
+  uint16_t cycle;
+  uint8_t event;
+};
+
+const uint8_t LOG_CAPACITY = 32;
+
+LogEntry LogRing[LOG_CAPACITY];
+
+volatile uint8_t LogHead = 0;
+volatile uint8_t LogTail = 0;
+volatile uint8_t LogDropped = 0;
+
+
+// Safe from any context. Costs a few dozen cycles.
+//
+// The cycle number is passed in rather than derived, because CurrentCycle
+// means different things either side of the increment in the shutter-close
+// ISR: before it, the cycle in progress is CurrentCycle + 1; after it, the
+// cycle that just finished is CurrentCycle. logEvent() covers the common
+// case and DONE uses logEventForCycle() directly.
+void logEventForCycle(uint8_t event, uint16_t cycle)
+{
+  if (!VerboseEnabled) {
+    return;
+  }
+
+  // Stamp first, so queueing cost is not included in the measurement.
+  unsigned long now = micros();
+
+  uint8_t sreg = SREG;
+  cli();
+
+  uint8_t next = LogHead + 1;
+
+  if (next >= LOG_CAPACITY) {
+    next = 0;
+  }
+
+  if (next == LogTail) {
+    if (LogDropped < 255) {
+      LogDropped++;
+    }
+
+  } else {
+    LogRing[LogHead].timestampUs = now;
+    LogRing[LogHead].cycle = cycle;
+    LogRing[LogHead].event = event;
+
+    LogHead = next;
+  }
+
+  SREG = sreg;
+}
+
+
+void logEvent(uint8_t event)
+{
+  logEventForCycle(event, CurrentCycle + 1);
+}
+
+
+// The "+" column is a gap between two consecutive drained events, so the
+// drain side carries state of its own. It has to be cleared here too, or the
+// first event of a run reports the gap since the *previous* run's last event
+// -- an interval that measures nothing and can be arbitrarily large.
+unsigned long LogLastUs = 0;
+bool LogHaveLast = false;
+
+void resetLog()
+{
+  uint8_t sreg = SREG;
+  cli();
+
+  LogHead = 0;
+  LogTail = 0;
+  LogDropped = 0;
+
+  SREG = sreg;
+
+  LogHaveLast = false;
+}
+
+
+// ----------------------------------------------------------------------------
+// DRAIN THE LOG
+//
+// Called from loop() only, and deliberately last, so arming the next cycle
+// never waits on a serial write.
+//
+// Lines are prefixed "V " so a host parser can separate them from command
+// responses. The "+" column is the gap since the previous logged event,
+// which is the number worth watching: it is the measured version of
+// delay_us, capture_us, and the laser's own response time.
+// ----------------------------------------------------------------------------
+
+void drainLog()
+{
+  while (LogTail != LogHead) {
+    uint8_t sreg = SREG;
+    cli();
+
+    LogEntry entry = LogRing[LogTail];
+
+    uint8_t next = LogTail + 1;
+
+    if (next >= LOG_CAPACITY) {
+      next = 0;
+    }
+
+    LogTail = next;
+
+    SREG = sreg;
+
+    Serial.print(F("V "));
+    Serial.print(entry.cycle);
+    Serial.print(' ');
+
+    switch (entry.event)
+    {
+      case LOG_CYCLE_BEGIN:   Serial.print(F("CYCLE_BEGIN"));   break;
+      case LOG_PULSE:         Serial.print(F("PULSE"));         break;
+      case LOG_CONFIRM:       Serial.print(F("CONFIRM"));       break;
+      case LOG_SHUTTER_OPEN:  Serial.print(F("SHUTTER_OPEN"));  break;
+      case LOG_SHUTTER_CLOSE: Serial.print(F("SHUTTER_CLOSE")); break;
+      case LOG_DONE:          Serial.print(F("DONE"));          break;
+      default:                Serial.print(F("UNKNOWN"));       break;
+    }
+
+    Serial.print(F(" t="));
+    Serial.print(entry.timestampUs);
+
+    if (LogHaveLast) {
+      Serial.print(F(" +"));
+      Serial.print(entry.timestampUs - LogLastUs);
+    }
+
+    Serial.println();
+
+    LogLastUs = entry.timestampUs;
+    LogHaveLast = true;
+  }
+
+  if (LogDropped > 0) {
+    uint8_t sreg = SREG;
+    cli();
+
+    uint8_t dropped = LogDropped;
+    LogDropped = 0;
+
+    SREG = sreg;
+
+    Serial.print(F("V LOG_DROPPED "));
+    Serial.println(dropped);
+  }
+}
 
 
 // ----------------------------------------------------------------------------
@@ -436,6 +658,9 @@ void laserConfirmISR()
   Timer1Event = TIMER_SHUTTER_OPEN;
 
   armTimer1(DelayTime);
+
+  // After arming, never before: the delay window starts at the line above.
+  logEvent(LOG_CONFIRM);
 }
 
 
@@ -460,6 +685,8 @@ ISR(TIMER1_COMPA_vect)
 
       armTimer1(CaptureTime);
 
+      logEvent(LOG_SHUTTER_OPEN);
+
       break;
 
     // ------------------------------------------------------------------------
@@ -467,6 +694,8 @@ ISR(TIMER1_COMPA_vect)
     // ------------------------------------------------------------------------
     case TIMER_SHUTTER_CLOSE:
       stopTimer1();
+
+      logEvent(LOG_SHUTTER_CLOSE);
 
       Timer1Event = TIMER_NONE;
 
@@ -476,6 +705,10 @@ ISR(TIMER1_COMPA_vect)
         State = COMPLETE;
 
         digitalWrite(LASER_ENABLE_PIN, LOW);
+
+        // CurrentCycle has already been incremented, so it is now the number
+        // of the cycle that just finished -- which is the one DONE belongs to.
+        logEventForCycle(LOG_DONE, CurrentCycle);
 
         PendingDone = true;
 
@@ -542,12 +775,21 @@ bool beginCycle()
   PendingCycleNumber = CurrentCycle + 1;
   PendingCycleStarted = true;
 
+  logEvent(LOG_CYCLE_BEGIN);
+
   // laser_signal idles HIGH and dips LOW to fire.
+  //
+  // Nothing goes between these three lines. A log push here would widen the
+  // pulse by however long it took.
   digitalWrite(LASER_SIGNAL_PIN, LASER_SIGNAL_FIRE);
 
   delayMicroseconds((unsigned int)LaserSignalPulseUs);
 
   digitalWrite(LASER_SIGNAL_PIN, LASER_SIGNAL_IDLE);
+
+  // Stamped at the trailing edge, so the gap from CYCLE_BEGIN is the
+  // measured pulse width plus a little call overhead.
+  logEvent(LOG_PULSE);
 
   return true;
 }
@@ -569,6 +811,8 @@ void startSequence()
 
   Timer1Event = TIMER_NONE;
   PendingNextCycle = false;
+
+  resetLog();
 
   stopTimer1();
   resetShutter();
@@ -646,6 +890,9 @@ const String SET_PULSE_COMMAND = "SET PULSE";
 
 const String GET_CONFIRM_TIMEOUT_COMMAND = "GET CONFIRM_TIMEOUT";
 const String SET_CONFIRM_TIMEOUT_COMMAND = "SET CONFIRM_TIMEOUT";
+
+const String GET_VERBOSE_COMMAND = "GET VERBOSE";
+const String SET_VERBOSE_COMMAND = "SET VERBOSE";
 
 
 // ----------------------------------------------------------------------------
@@ -731,9 +978,13 @@ void printHelp()
                  String(MIN_CONFIRM_TIMEOUT_MS) + "-" + MAX_CONFIRM_TIMEOUT_MS + "ms",
                  F("confirm wait, 0 disables"));
 
+  printHelpField(F("SET VERBOSE <0|1>"),
+                 String("0-1"),
+                 F("measured event log"));
+
   Serial.println();
 
-  Serial.println(F("  GET reads back any of the five settings, e.g. GET DELAY."));
+  Serial.println(F("  GET reads back any of the six settings, e.g. GET DELAY."));
   Serial.println(F("  SET, HELP and INFO are rejected with ERROR BUSY while running."));
 
   Serial.println(F("OK HELP END"));
@@ -829,6 +1080,8 @@ void printBanner()
   printBannerRow(F("CONFIRM_TIMEOUT"),
                  ConfirmTimeoutMs == 0 ? String("0 (disabled)")
                                        : String(ConfirmTimeoutMs) + "ms");
+
+  printBannerRow(F("VERBOSE"), VerboseEnabled ? F("1 (event log on)") : F("0"));
 
   Serial.println();
 
@@ -1038,6 +1291,12 @@ void processCommand(String command)
     return;
   }
 
+  if (command == GET_VERBOSE_COMMAND) {
+    Serial.println(getVerboseResponseString());
+
+    return;
+  }
+
   // --------------------------------------------------------------------------
   // SETs
   //
@@ -1104,6 +1363,23 @@ void processCommand(String command)
 
       return;
     }
+
+    if (command.startsWith(SET_VERBOSE_COMMAND)) {
+      unsigned long value;
+
+      if (parseScalarArg(command.substring(SET_VERBOSE_COMMAND.length()),
+                         "VERBOSE", 0, 1, value)) {
+        VerboseEnabled = (value != 0);
+
+        // Drop anything queued under the previous setting so timestamps in
+        // the log always belong to the run being watched.
+        resetLog();
+
+        Serial.println(getVerboseResponseString());
+      }
+
+      return;
+    }
   }
 
   Serial.println("ERROR UNKNOWN COMMAND");
@@ -1116,6 +1392,14 @@ void processCommand(String command)
 
 void servicePending()
 {
+  // Arm the next cycle before printing anything. Serial writes are slow
+  // enough to show up as inter-cycle jitter if they happen first.
+  if (PendingNextCycle) {
+    PendingNextCycle = false;
+
+    beginCycle();
+  }
+
   if (PendingCycleStarted) {
     noInterrupts();
 
@@ -1126,12 +1410,6 @@ void servicePending()
 
     Serial.print("CYCLE ");
     Serial.println(cycle);
-  }
-
-  if (PendingNextCycle) {
-    PendingNextCycle = false;
-
-    beginCycle();
   }
 
   if (PendingDone) {
@@ -1147,6 +1425,12 @@ void servicePending()
     abortSequence();
 
     Serial.println("ERROR LASER CONFIRM TIMEOUT");
+  }
+
+  // Last, so the next cycle is already armed before we spend time on the
+  // serial write.
+  if (VerboseEnabled) {
+    drainLog();
   }
 }
 
