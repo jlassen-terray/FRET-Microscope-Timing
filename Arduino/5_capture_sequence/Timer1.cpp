@@ -71,26 +71,40 @@ void stopTimer1()
 }
 
 
-// OC1A runs in hardware toggle mode, so the pin state depends on how many
-// compare matches have happened. An odd number leaves the gate open, which is
-// what an abort mid-capture produces, so there has to be a way to force it
-// back to released.
+// CTC keeps counting after a match, so a window keeps matching every OCR1A
+// until the compare ISR re-arms it. A 1 us delay is 16 ticks, and the ISR
+// cannot run until laserConfirmISR returns -- 15+ us with VERBOSE on. In
+// toggle mode every one of those extra matches flipped the gate, and an odd
+// count left it inverted: closed for the capture, open between cycles. Set
+// and clear are idempotent, so extra matches are harmless.
+void openShutterOnMatch()
+{
+  TCCR1A = (1 << COM1A1) | (1 << COM1A0);
+}
+
+void closeShutterOnMatch()
+{
+  TCCR1A = (1 << COM1A1);
+}
+
+
+// An abort mid-capture leaves the gate open, so there has to be a way to force
+// it back to released.
 //
 // Writing the port will not do it. While a COM1A bit is set the waveform
 // generator owns the pin, and the value it drives lives in the OC1A register,
 // which keeps its state across a TCCR1A write. Disconnecting the output,
 // writing PORTB low and reconnecting therefore only drives the pin low for the
-// few cycles it is disconnected: the moment toggle mode comes back, the stale
+// few cycles it is disconnected: the moment the output reconnects, the stale
 // OC1A register reappears on the pin and the shutter is open again.
 //
 // The supported way to set OC1A directly is a forced compare. Select "clear on
 // compare match" and strobe FOC1A: the compare output logic applies the COM1A
 // setting to the OC1A register without raising OCF1A and without resetting the
-// counter. Then restore toggle mode for the next window.
+// counter. Clear mode is left selected, so a stray match can only close.
 void resetShutter()
 {
-  TCCR1A = (1 << COM1A1);
-  TCCR1C = (1 << FOC1A);
+  closeShutterOnMatch();
 
-  TCCR1A = (1 << COM1A0);
+  TCCR1C = (1 << FOC1A);
 }

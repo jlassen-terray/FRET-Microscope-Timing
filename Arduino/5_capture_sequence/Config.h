@@ -59,11 +59,19 @@ const uint8_t SHUTTER_ENABLE_PIN = 11;
 // SIGNAL POLARITY
 //
 // Inputs are treated as active-high and driven push-pull. If a source is
-// open-collector, switch its pinMode to INPUT_PULLUP in setup(), flip the
-// active level here, and change the confirm edge to FALLING.
+// open-collector, switch it to INPUT_PULLUP, flip its active level here, and
+// change the confirm edge to FALLING. The camera's pinMode is in setup();
+// laser_confirm's is LASER_CONFIRM_INPUT_MODE, kept beside the edge it has to
+// agree with.
+//
+// A bare button is the open-collector case: nothing drives the pin while the
+// contact is open, so a plain INPUT floats and fires the confirm interrupt on
+// coupled noise alone. Button to GND, INPUT_PULLUP, FALLING.
 // ----------------------------------------------------------------------------
 
 const uint8_t CAMERA_ACTIVE_LEVEL = HIGH;
+
+const uint8_t LASER_CONFIRM_INPUT_MODE = INPUT;
 
 const int LASER_CONFIRM_EDGE = RISING;
 
@@ -97,6 +105,28 @@ const unsigned long MAX_PULSE_US = 16383;
 
 const unsigned long MIN_CONFIRM_TIMEOUT_MS = 0;
 const unsigned long MAX_CONFIRM_TIMEOUT_MS = 600000UL;
+
+
+// ----------------------------------------------------------------------------
+// LASER CONFIRM DEBOUNCE
+//
+// Set with SET CONFIRM_DEBOUNCE <us>. A lockout on the confirm line, for when
+// it is a mechanical contact rather than a laser. Defaults to 20 ms; see the
+// rig-install note on ConfirmDebounceUs in Settings.cpp.
+//
+// While it is non-zero the interrupt is CHANGE, not LASER_CONFIRM_EDGE, and
+// the delay starts on the first edge out of DEBOUNCED_IDLE_LEVEL after the
+// line has been quiet that long. HIGH means the falling edge: the release of
+// a button to 5V, the press of a button to GND.
+//
+// A laser cannot confirm in this mode. Its pulse's two edges land inside one
+// lockout, so the second is rejected as bounce, and the first leaves LOW.
+// ----------------------------------------------------------------------------
+
+const unsigned long MIN_CONFIRM_DEBOUNCE_US = 0;
+const unsigned long MAX_CONFIRM_DEBOUNCE_US = 1000000UL;
+
+const uint8_t DEBOUNCED_IDLE_LEVEL = HIGH;
 
 
 // ----------------------------------------------------------------------------

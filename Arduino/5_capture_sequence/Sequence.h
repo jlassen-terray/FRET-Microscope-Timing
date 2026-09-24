@@ -46,7 +46,11 @@ void abortSequence();
 // Drain the work the ISRs handed back. From loop() only.
 void servicePending();
 
-// Attached to LASER_CONFIRM_PIN by setup().
+// Attached to LASER_CONFIRM_PIN by attachConfirmInterrupt().
 void laserConfirmISR();
+
+// The edge depends on CONFIRM_DEBOUNCE: LASER_CONFIRM_EDGE when it is 0,
+// CHANGE otherwise. Call from setup() and after every SET CONFIRM_DEBOUNCE.
+void attachConfirmInterrupt();
 
 #endif

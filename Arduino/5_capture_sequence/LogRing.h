@@ -30,6 +30,7 @@ enum LogEventId : uint8_t
   LOG_CYCLE_BEGIN,
   LOG_PULSE,
   LOG_CONFIRM,
+  LOG_CONFIRM_BOUNCE,
   LOG_SHUTTER_OPEN,
   LOG_SHUTTER_CLOSE,
   LOG_DONE
@@ -47,6 +48,19 @@ void beginLog();
 // to: in the shutter-close ISR, CurrentCycle means different things either
 // side of the increment. Sequence.cpp wraps this for the common case.
 void logEventForCycle(uint8_t event, uint16_t cycle);
+
+// For an event whose ISR is too timing-critical to log from. The ISR takes
+// readLogClock() -- one 16 bit register read -- and the event is pushed later,
+// with ageUs saying roughly how long ago it happened. ageUs only has to be
+// right to within half a Timer5 wrap, 2048 us; the fine stamp is exact.
+void logEventAt(uint8_t event, uint16_t cycle, uint16_t fineTicks,
+                unsigned long ageUs);
+
+// Unguarded 16 bit read, so call it with interrupts off -- from an ISR.
+inline uint16_t readLogClock()
+{
+  return TCNT5;
+}
 
 // Discard anything queued, and clear the drain-side state with it.
 void resetLog();
