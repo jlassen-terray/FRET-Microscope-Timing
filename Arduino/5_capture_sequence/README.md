@@ -287,8 +287,10 @@ closing and the next cycle arming. And a `confirm_timeout` of `0` removes the
 
 ## Commands
 
-9600 baud, newline-terminated, case-insensitive. The sketch prints `READY`
-once on boot.
+9600 baud, newline-terminated, case-insensitive. On boot the sketch prints the
+banner described under [Boot banner](#boot-banner) and then `READY`. `READY` is
+still the last line of boot output, so a host that waits for it needs no
+changes.
 
 | Command | Range | Default | Meaning |
 |---------|-------|---------|---------|
@@ -300,6 +302,7 @@ once on boot.
 | `START` | — | — | Runs the sequence |
 | `ABORT` (or `STOP`) | — | — | Drops laser_enable, releases the shutter |
 | `STATUS` | — | — | State, cycle progress, live camera level |
+| `INFO` | — | — | Reprints the boot banner |
 | `HELP` (or `?`) | — | — | Lists every command |
 
 `SET PULSE` is the runtime control for `LaserSignalPulseUs`;
@@ -317,6 +320,7 @@ OK HELP
   START                     run CYCLE_COUNT cycles
   ABORT | STOP              stop, drop laser_enable, free shutter
   STATUS                    state, cycle progress, camera level
+  INFO                      reprint the boot banner
   HELP | ?                  this list
 
   SET DELAY <us>            1-1000000us   laser_confirm to shutter open
@@ -326,14 +330,14 @@ OK HELP
   SET CONFIRM_TIMEOUT <ms>  0-600000ms    confirm wait, 0 disables
 
   GET reads back any of the five settings, e.g. GET DELAY.
-  SET and HELP are rejected with ERROR BUSY while running.
+  SET, HELP and INFO are rejected with ERROR BUSY while running.
 OK HELP END
 ```
 
-This is the one multi-line response in the protocol. Every body line is
-indented by two spaces and the block is bracketed by `OK HELP` and
-`OK HELP END`, so a host reading line by line can swallow everything between
-the two markers without parsing the entries.
+Every body line is indented by two spaces and the block is bracketed by
+`OK HELP` and `OK HELP END`, so a host reading line by line can swallow
+everything between the two markers without parsing the entries. The boot
+banner below is the only other multi-line response and follows the same shape.
 
 `HELP` is rejected with `ERROR BUSY` while a sequence is running, for a
 different reason than `SET` is. The block is roughly 700 bytes — about 700 ms
@@ -341,6 +345,72 @@ at 9600 baud once the 64-byte transmit buffer backs up — and `loop()` is what
 starts each next cycle, so printing it mid-run would stretch the gap between
 cycles. The text is stored in flash with `F()`; in RAM it would cost a tenth of
 the Mega's SRAM.
+
+### Boot banner
+
+`setup()` prints a banner before `READY`, and `INFO` reprints it on demand.
+It answers the three questions asked at the start of every bring-up session:
+what is running on this board, how is it wired, and what is it set to.
+
+```
+INFO
+  FRET Capture Sequence Controller
+  version 1.0.0   built Sep 23 2026 18:42:11
+  Arduino Mega 2560   serial 9600 8N1
+
+  Pins
+    laser_enable      8    output, held HIGH for the run
+    laser_signal      9    output, idles HIGH, pulses LOW
+    laser_confirm     2    input, interrupt on RISING
+    camera_capturing  3    input, active HIGH
+    shutter_enable    11   output, OC1A, driven by Timer1
+
+  Settings
+    DELAY             1us -> 1us (16 ticks @ /1)
+    CAPTURE           50us -> 50us (800 ticks @ /1)
+    CYCLE_COUNT       1
+    PULSE             10us
+    CONFIRM_TIMEOUT   5000ms
+
+  Inputs now
+    camera_capturing  IDLE
+    laser_confirm     LOW
+
+  HELP lists the commands, STATUS reports live state.
+INFO END
+READY
+```
+
+Four things in there earn their place:
+
+- **`built`** is stamped by the compiler from `__DATE__` and `__TIME__`, so the
+  banner settles "is the board actually running my latest upload?" without a
+  round trip. One caveat: a cached build is not recompiled, so an unchanged
+  sketch keeps its earlier stamp. Touch the file or clean the build if the
+  timestamp has to be trustworthy.
+- **Pins** are printed from the same constants the sketch wires up, so the
+  banner cannot describe a pinout the firmware is not using.
+- **Settings** are the live values, not the defaults. After `INFO` that means
+  whatever you have `SET` so far this session.
+- **Inputs now** is read with `digitalRead` as the banner prints. A camera line
+  that is dark or miswired shows up here at boot, rather than as an
+  `ERROR CAMERA NOT CAPTURING` on your first `START`.
+
+The block is bracketed by `INFO` and `INFO END` on the same principle as
+`HELP`. Note that the banner is deliberately **not** the boot marker — `READY`
+is. That keeps the `INFO` markers honest when the block is reprinted
+mid-session, and it means an unexpected `READY` still tells a host the board
+reset under it.
+
+`INFO` is rejected with `ERROR BUSY` while a sequence is running, for the same
+reason `HELP` is: at 9600 baud the block takes roughly a second to clock out,
+and `loop()` is what starts each next cycle.
+
+Identity lives in `FIRMWARE_NAME` and `FIRMWARE_VERSION` at the top of the
+sketch. Both are `PROGMEM`, as is every fixed string in the banner, so the
+whole thing costs about 2.1 kB of flash and no meaningful SRAM. Bump
+`FIRMWARE_VERSION` when the protocol changes, since that is what a host would
+gate its behaviour on.
 
 ### Responses
 
@@ -391,7 +461,7 @@ consistent behaviour.
 | Error | Cause |
 |-------|-------|
 | `ERROR UNKNOWN COMMAND` | Unrecognised input |
-| `ERROR BUSY` | `START`, `HELP`, or any `SET` while a sequence is running |
+| `ERROR BUSY` | `START`, `HELP`, `INFO`, or any `SET` while a sequence is running |
 | `ERROR CAMERA NOT CAPTURING` | `camera_capturing` low at the start of any cycle; sequence aborts |
 | `ERROR LASER CONFIRM TIMEOUT` | No `laser_confirm` within `confirm_timeout`; sequence aborts |
 | `ERROR <FIELD> VALUE` | Argument is not a plain non-negative integer |
@@ -416,6 +486,10 @@ These were added and are all easy to strip:
 - `HELP`/`?` — the command set has grown past what is worth remembering at a
   serial monitor, and quoting the limits from the constants means the board
   documents itself.
+- The boot banner and `INFO` — the spec's `READY` says the board is alive but
+  not which build, which pinout, or what it is set to. `INFO` exists because a
+  host that opens the port after boot has already missed the banner, which is
+  the common case rather than the exception.
 - The prescaler selection, which extends `delay_us` and `capture_us` past the
   4096 µs a fixed unprescaled Timer1 would cap them at.
 
